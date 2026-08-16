@@ -14,6 +14,8 @@
 /*.jpg
 /*.jpeg
 /*.png
+/*.heic
+/*.HEIC
 /*.rtf
 
 # Generated application bundle (the distributable ZIP is kept in dist/)
