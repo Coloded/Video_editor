@@ -1,0 +1,1794 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# FFmpeg option values always require a dot as the decimal separator.
+unset LC_ALL
+export LC_NUMERIC=C
+
+# Cut or compress audio and video files.
+
+SCRIPT_DIR="${0:A:h}"
+COMMAND="cut"
+INPUT_RAW=""
+MANIFEST_RAW=""
+START_RAW=""
+END_RAW=""
+OUTPUT_RAW=""
+OVERWRITE=0
+COMPRESS_PROFILE=""
+CODEC_RAW=""
+BITRATE_RAW=""
+USE_SOFTWARE=0
+PLAIN_PROGRESS=0
+TMP_FILES=()
+FFMPEG_PID=""
+
+cleanup() {
+  local file
+  if [[ -n "${FFMPEG_PID:-}" ]] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
+    kill "$FFMPEG_PID" 2>/dev/null || true
+    wait "$FFMPEG_PID" 2>/dev/null || true
+  fi
+  for file in "${TMP_FILES[@]:-}"; do
+    [[ -n "$file" && -e "$file" ]] && rm -f "$file"
+  done
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<'EOF'
+video_editor — вырезание, сжатие и склейка аудио/видео
+
+Использование:
+  video_editor cut -f FILE
+  video_editor cut -f FILE -s START -e END
+  video_editor compress PROFILE -f FILE
+  video_editor compress --profile PROFILE -f FILE
+  video_editor join --manifest FILE -o RESULT.mp4
+  video_editor -f FILE -s START -e END
+  video_editor help
+
+Команды:
+  cut                    Вырезать фрагмент без повторного кодирования
+  compress PROFILE       Сжать видео по явно указанному профилю
+  join                    Склеить ролики из манифеста в один MP4
+  help                   Показать эту справку
+
+Команда cut используется по умолчанию, поэтому её можно не писать. Для cut,
+если -s или -e не указаны, программа сначала спросит старт, затем конец.
+
+Общие параметры:
+  -f, --file FILE       Исходный аудио- или видеофайл
+  -o, --output FILE     Имя результата
+  -y, --overwrite       Перезаписать существующий результат
+  -h, --help            Показать эту справку
+
+Параметры cut:
+  -s, --start TIME      Начало фрагмента
+  -e, --end TIME        Конец фрагмента
+
+Параметры compress:
+  -p, --profile NAME    240, 360, 480, 720, 1080, 1440, 2160,
+                        youtube или youtube-compact
+  -c, --codec CODEC     h264 или hevc; переопределяет кодек профиля
+  -b, --bitrate MBPS    Видеобитрейт в Мбит/с, например 40 или 40M
+  --no-gpu, --cpu       Не использовать VideoToolbox; кодировать процессором
+  --software            То же, что --no-gpu (для совместимости)
+  -s START -e END       Одновременно вырезать и сжать указанный фрагмент
+
+Параметры join:
+  --manifest FILE       TSV-файл: путь, старт и конец каждого ролика
+  -p, --profile NAME    Дополнительно сжать результат выбранным профилем
+  --no-gpu, --cpu       Склеивать и кодировать процессором
+
+Аппаратное ускорение Apple VideoToolbox включено по умолчанию. Если аппаратный
+кодировщик недоступен для данного разрешения, программа сама использует CPU.
+Во время работы две строки обновляются на месте: сверху CPU, занятые ядра, RAM,
+кодировщик и скорость записи; снизу прогресс, время и прогноз размера.
+
+Профили сжатия:
+  240                    MP4, H.264, до 426x240, 0.6 Мбит/с
+  360                    MP4, H.264, до 640x360, 1 Мбит/с
+  480                    MP4, H.264, до 854x480, 2.5 Мбит/с
+  720                    MP4, H.264, до 1280x720, 5 Мбит/с
+  1080                   MP4, H.264, до 1920x1080, 8 Мбит/с
+  1440                   MP4, H.264, до 2560x1440, 16 Мбит/с
+  2160                   MP4, H.264, до 3840x2160, 40 Мбит/с
+  youtube                То же, что 2160: YouTube 4K SDR
+  youtube-compact        MP4, 4K, HEVC, 24 Мбит/с, AAC, Fast Start
+
+  Для видео 50/60 fps битрейт автоматически увеличивается. Число профиля —
+  короткая сторона кадра: горизонтальное и вертикальное видео поддерживаются.
+
+Профиль указывать обязательно. Разрешение вверх не растягивается. Даже если
+разрешение исходника совпадает с профилем, видео перекодируется для уменьшения
+размера. В результате остаются первая видеодорожка и первая аудиодорожка.
+
+Форматы времени:
+  90                    секунды
+  90.5                  секунды с долями
+  1:30                  минуты:секунды
+  00:01:30.500          часы:минуты:секунды
+
+Примеры:
+  video_editor -f "video.mp4"
+  video_editor cut -f "video.mp4" -s 1:30 -e 1:50
+  video_editor cut -f "audio.ogg" -s 10 -e 25 -o "fragment.ogg"
+  video_editor compress 1080 -f "video.mp4"
+  video_editor compress 1080 --no-gpu -f "video.mp4"
+  video_editor compress 720 -f "vertical.mov"
+  video_editor compress 2160 -f "video-4k.mp4"
+  video_editor compress youtube -f "video.mp4"
+  video_editor compress youtube-compact -f "video.mp4"
+  video_editor compress --profile youtube -f "video.mp4" --bitrate 35
+  video_editor join --manifest clips.tsv -o "result.mp4"
+
+Результат сохраняется рядом с исходником. Cut копирует потоки без изменения
+качества. Compress сохраняет частоту кадров и пропорции, уменьшает разрешение
+до выбранного профиля и создаёт совместимый с macOS MP4.
+EOF
+}
+
+die() {
+  echo "Ошибка: $1" >&2
+  exit 1
+}
+
+need_tool() {
+  command -v "$1" >/dev/null 2>&1 || \
+    die "не найден $1. Установите FFmpeg: brew install ffmpeg"
+}
+
+resolve_input() {
+  local raw="$1"
+
+  if [[ -f "$raw" ]]; then
+    echo "${raw:A}"
+  elif [[ -f "$SCRIPT_DIR/$raw" ]]; then
+    echo "${SCRIPT_DIR:A}/$raw"
+  else
+    echo "$raw"
+  fi
+}
+
+parse_time() {
+  local raw="$1"
+
+  awk -v raw="$raw" 'BEGIN {
+    count = split(raw, part, ":")
+    if (count < 1 || count > 3) exit 1
+
+    for (i = 1; i <= count; i++) {
+      if (part[i] !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+    }
+
+    if (count == 1) {
+      seconds = part[1]
+    } else if (count == 2) {
+      if (part[2] >= 60) exit 1
+      seconds = part[1] * 60 + part[2]
+    } else {
+      if (part[2] >= 60 || part[3] >= 60) exit 1
+      seconds = part[1] * 3600 + part[2] * 60 + part[3]
+    }
+
+    printf "%.6f", seconds
+  }'
+}
+
+format_time() {
+  local value="${1:-0}"
+
+  awk -v value="$value" 'BEGIN {
+    if (value < 0) value = 0
+    hours = int(value / 3600)
+    minutes = int((value - hours * 3600) / 60)
+    seconds = value - hours * 3600 - minutes * 60
+    printf "%02d:%02d:%06.3f", hours, minutes, seconds
+  }'
+}
+
+safe_time_label() {
+  local value="$1"
+  value="$(format_time "$value")"
+  value="${value//:/-}"
+  value="${value//./_}"
+  echo "$value"
+}
+
+media_duration() {
+  ffprobe -v error \
+    -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$1" 2>/dev/null
+}
+
+stream_value() {
+  local input="$1"
+  local selector="$2"
+  local field="$3"
+
+  ffprobe -v error \
+    -select_streams "$selector" \
+    -show_entries "stream=$field" \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$input" 2>/dev/null | sed -n '1p'
+}
+
+normalize_bitrate() {
+  local raw="${1:-}"
+  raw="${raw%M}"
+  raw="${raw%m}"
+
+  awk -v value="$raw" 'BEGIN {
+    if (value !~ /^[0-9]+([.][0-9]+)?$/ || value <= 0) exit 1
+    printf "%.3f", value
+  }'
+}
+
+format_file_size() {
+  local bytes="${1:-0}"
+
+  awk -v bytes="$bytes" 'BEGIN {
+    if (bytes >= 1000000000) {
+      printf "%.3f ГБ", bytes / 1000000000
+    } else if (bytes >= 1000000) {
+      printf "%.1f МБ", bytes / 1000000
+    } else if (bytes >= 1000) {
+      printf "%.1f КБ", bytes / 1000
+    } else {
+      printf "%d Б", bytes
+    }
+  }'
+}
+
+smooth_size_estimate() {
+  local prior="$1"
+  local previous="$2"
+  local bytes="$3"
+  local position="$4"
+  local target="$5"
+
+  awk -v prior="$prior" -v previous="$previous" -v bytes="$bytes" \
+    -v position="$position" -v target="$target" 'BEGIN {
+      progress = position / target
+      raw = bytes * target / position
+
+      if (progress <= 0.05) {
+        blended = prior
+      } else {
+        normalized = (progress - 0.05) / 0.95
+        if (normalized > 1) normalized = 1
+        weight = normalized ^ 0.80
+
+        if (normalized < 0.35) {
+          lower = prior * 0.65
+          upper = prior * 1.35
+          if (raw < lower) raw = lower
+          if (raw > upper) raw = upper
+        }
+
+        blended = prior * (1 - weight) + raw * weight
+      }
+
+      smoothed = previous * 0.80 + blended * 0.20
+      printf "%.0f", smoothed
+    }'
+}
+
+unique_output_path() {
+  local candidate="$1"
+
+  if [[ "$OVERWRITE" == "1" || ! -e "$candidate" ]]; then
+    echo "$candidate"
+    return
+  fi
+
+  local dir name stem extension number
+  dir="$(dirname "$candidate")"
+  name="$(basename "$candidate")"
+
+  if [[ "$name" == *.* ]]; then
+    stem="${name%.*}"
+    extension=".${name##*.}"
+  else
+    stem="$name"
+    extension=""
+  fi
+
+  number=1
+  while [[ -e "$dir/$stem-$number$extension" ]]; do
+    number=$((number + 1))
+  done
+
+  echo "$dir/$stem-$number$extension"
+}
+
+print_progress() {
+  local started="$1"
+  local target="$2"
+  local position="$3"
+  local subject="${4:-Фрагмент}"
+  local speed="${5:---}"
+  local current_size="${6:-}"
+  local predicted_size="${7:-}"
+  local elapsed percent eta now spinner bar bar_width filled index
+  local size_text=""
+
+  now="$(date +%s)"
+  elapsed=$((now - started))
+  percent="$(awk -v position="$position" -v target="$target" 'BEGIN {
+    value = target > 0 ? position * 100 / target : 0
+    if (value > 100) value = 100
+    if (value < 0) value = 0
+    printf "%d", value
+  }')"
+  eta="$(awk -v elapsed="$elapsed" -v position="$position" -v target="$target" 'BEGIN {
+    value = position > 0 ? elapsed * (target - position) / position : 0
+    if (value < 0) value = 0
+    printf "%.0f", value
+  }')"
+
+  case $((now % 4)) in
+    0) spinner="|" ;;
+    1) spinner="/" ;;
+    2) spinner="-" ;;
+    3) spinner="\\" ;;
+  esac
+
+  bar_width=24
+  filled=$((percent * bar_width / 100))
+  bar=""
+  for ((index = 0; index < bar_width; index++)); do
+    if (( index < filled )); then
+      bar+="#"
+    else
+      bar+="-"
+    fi
+  done
+
+  speed="${speed//[[:space:]]/}"
+  [[ -z "$speed" || "$speed" == "N/A" ]] && speed="--"
+  if [[ -n "$current_size" && -n "$predicted_size" ]]; then
+    size_text=" | файл $current_size -> итог ~$predicted_size"
+  fi
+  if [[ "$PLAIN_PROGRESS" == "1" ]]; then
+    printf "%s [%s] %3d%% | %s %s/%s | прошло %s | осталось %s | %s%s\n" \
+      "$spinner" "$bar" "$percent" "$subject" \
+      "$(format_time "$position")" "$(format_time "$target")" \
+      "$(format_time "$elapsed")" "$(format_time "$eta")" "$speed" "$size_text"
+  else
+    printf "\r\033[K%s [%s] %3d%% | %s %s/%s | прошло %s | осталось %s | %s%s" \
+      "$spinner" "$bar" "$percent" "$subject" \
+      "$(format_time "$position")" "$(format_time "$target")" \
+      "$(format_time "$elapsed")" "$(format_time "$eta")" "$speed" "$size_text"
+  fi
+}
+
+run_join() {
+  [[ -n "$MANIFEST_RAW" ]] || die "для join нужен --manifest FILE"
+  local manifest
+  manifest="${MANIFEST_RAW:A}"
+  [[ -f "$manifest" ]] || die "манифест не найден: $MANIFEST_RAW"
+
+  local -a inputs starts ends durations has_audio input_args
+  local clip_path start_raw end_raw start end duration clip_duration
+  local clip_codec clip_pixel_format clip_color_transfer
+  while IFS=$'\t' read -r clip_path start_raw end_raw; do
+    [[ -n "$clip_path" ]] || continue
+    [[ -f "$clip_path" ]] || die "ролик не найден: $clip_path"
+    clip_codec="$(stream_value "$clip_path" "v:0" "codec_name")"
+    [[ -n "$clip_codec" ]] || die "в файле нет видеодорожки: $clip_path"
+    clip_pixel_format="$(stream_value "$clip_path" "v:0" "pix_fmt")"
+    clip_color_transfer="$(stream_value "$clip_path" "v:0" "color_transfer")"
+    case "$clip_color_transfer" in
+      smpte2084|arib-std-b67)
+        die "HDR-ролик пока нельзя безопасно склеить: $clip_path"
+        ;;
+    esac
+    if [[ "$clip_pixel_format" == *10* || "$clip_pixel_format" == *12* ]]; then
+      die "10/12-битный ролик пока нельзя безопасно склеить: $clip_path"
+    fi
+    duration="$(media_duration "$clip_path")"
+    [[ -n "$duration" && "$duration" != "N/A" ]] || \
+      die "не удалось определить длительность: $clip_path"
+    start="$(parse_time "$start_raw")" || die "неверный старт для $clip_path: $start_raw"
+    end="$(parse_time "$end_raw")" || die "неверный конец для $clip_path: $end_raw"
+    awk -v start="$start" -v end="$end" -v duration="$duration" \
+      'BEGIN { exit !(start >= 0 && end > start && end <= duration + 0.001) }' || \
+      die "неверные границы фрагмента: $clip_path"
+    clip_duration="$(awk -v start="$start" -v end="$end" \
+      'BEGIN { printf "%.6f", end - start }')"
+    inputs+=("${clip_path:A}")
+    starts+=("$start")
+    ends+=("$end")
+    durations+=("$clip_duration")
+    if [[ -n "$(stream_value "$clip_path" "a:0" "codec_name")" ]]; then
+      has_audio+=("1")
+    else
+      has_audio+=("0")
+    fi
+  done < "$manifest"
+
+  (( ${#inputs[@]} >= 2 )) || die "для склейки нужно минимум два ролика"
+
+  local first="${inputs[1]}"
+  local first_width first_height first_fps_raw first_codec target_width target_height target_fps
+  local target_short_side="" output_codec="h264" profile_label="Без дополнительного сжатия"
+  first_width="$(stream_value "$first" "v:0" "width")"
+  first_height="$(stream_value "$first" "v:0" "height")"
+  first_fps_raw="$(stream_value "$first" "v:0" "avg_frame_rate")"
+  first_codec="$(stream_value "$first" "v:0" "codec_name")"
+  [[ "$first_width" =~ '^[0-9]+$' && "$first_height" =~ '^[0-9]+$' ]] || \
+    die "в первом файле нет видеодорожки"
+  if [[ -n "$COMPRESS_PROFILE" ]]; then
+    COMPRESS_PROFILE="${COMPRESS_PROFILE:l}"
+    COMPRESS_PROFILE="${COMPRESS_PROFILE%p}"
+    case "$COMPRESS_PROFILE" in
+      240|360|480|720|1080|1440|2160)
+        target_short_side="$COMPRESS_PROFILE"
+        profile_label="${COMPRESS_PROFILE}p SDR"
+        ;;
+      youtube|youtube-4k)
+        COMPRESS_PROFILE="youtube"
+        target_short_side="2160"
+        profile_label="YouTube 4K SDR"
+        ;;
+      youtube-compact|compact-4k)
+        COMPRESS_PROFILE="youtube-compact"
+        target_short_side="2160"
+        output_codec="hevc"
+        profile_label="YouTube компактный 4K SDR"
+        ;;
+      *)
+        die "неизвестный профиль склейки: $COMPRESS_PROFILE"
+        ;;
+    esac
+
+    local clip_width clip_height clip_short_side
+    for clip_path in "${inputs[@]}"; do
+      clip_width="$(stream_value "$clip_path" "v:0" "width")"
+      clip_height="$(stream_value "$clip_path" "v:0" "height")"
+      [[ "$clip_width" =~ '^[0-9]+$' && "$clip_height" =~ '^[0-9]+$' ]] || \
+        die "в файле нет видеодорожки: $clip_path"
+      clip_short_side=$((clip_width < clip_height ? clip_width : clip_height))
+      (( clip_short_side >= target_short_side )) || \
+        die "профиль ${COMPRESS_PROFILE} выше разрешения ролика: $clip_path"
+    done
+
+    if (( first_width >= first_height )); then
+      target_height="$target_short_side"
+      target_width="$(awk -v width="$first_width" -v height="$first_height" \
+        -v target="$target_short_side" 'BEGIN { printf "%d", int((width * target / height) / 2 + 0.5) * 2 }')"
+    else
+      target_width="$target_short_side"
+      target_height="$(awk -v width="$first_width" -v height="$first_height" \
+        -v target="$target_short_side" 'BEGIN { printf "%d", int((height * target / width) / 2 + 0.5) * 2 }')"
+    fi
+  else
+    target_width=$((first_width / 2 * 2))
+    target_height=$((first_height / 2 * 2))
+  fi
+  target_fps="$(awk -v rate="$first_fps_raw" 'BEGIN {
+    split(rate, part, "/")
+    value = part[2] > 0 ? part[1] / part[2] : part[1]
+    if (value <= 0) value = 30
+    if (value > 60) value = 60
+    printf "%.6f", value
+  }')"
+
+  local total_duration="0"
+  local filter_complex=""
+  local concat_inputs=""
+  local index zero_index
+  for ((index = 1; index <= ${#inputs[@]}; index++)); do
+    zero_index=$((index - 1))
+    input_args+=("-i" "${inputs[index]}")
+    filter_complex+="[${zero_index}:v:0]trim=start=${starts[index]}:end=${ends[index]},setpts=PTS-STARTPTS,scale=${target_width}:${target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${target_width}:${target_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${target_fps},format=yuv420p[v${zero_index}];"
+    if [[ "${has_audio[index]}" == "1" ]]; then
+      filter_complex+="[${zero_index}:a:0]atrim=start=${starts[index]}:end=${ends[index]},asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${zero_index}];"
+    else
+      filter_complex+="anullsrc=r=48000:cl=stereo,atrim=duration=${durations[index]},asetpts=PTS-STARTPTS[a${zero_index}];"
+    fi
+    concat_inputs+="[v${zero_index}][a${zero_index}]"
+    total_duration="$(awk -v total="$total_duration" -v clip="${durations[index]}" \
+      'BEGIN { printf "%.6f", total + clip }')"
+  done
+  filter_complex+="${concat_inputs}concat=n=${#inputs[@]}:v=1:a=1[outv][outa]"
+
+  local first_dir="${first:h}"
+  local first_name="${first:t:r}"
+  local output
+  if [[ -n "$OUTPUT_RAW" ]]; then
+    if [[ "$OUTPUT_RAW" == */* ]]; then
+      output="${OUTPUT_RAW:A}"
+    else
+      output="$first_dir/$OUTPUT_RAW"
+    fi
+  else
+    output="$first_dir/$first_name.joined.mp4"
+  fi
+  output="$(unique_output_path "$output")"
+  [[ -d "${output:h}" ]] || die "папка результата не существует: ${output:h}"
+
+  local short_side video_bitrate maxrate bufsize video_encoder encoder_label
+  short_side=$((target_width < target_height ? target_width : target_height))
+  if (( short_side <= 240 )); then
+    video_bitrate="0.600"
+  elif (( short_side <= 360 )); then
+    video_bitrate="1.000"
+  elif (( short_side <= 480 )); then
+    video_bitrate="2.500"
+  elif (( short_side <= 720 )); then
+    video_bitrate="5.000"
+  elif (( short_side <= 1080 )); then
+    video_bitrate="8.000"
+  elif (( short_side <= 1440 )); then
+    video_bitrate="16.000"
+  else
+    video_bitrate="40.000"
+  fi
+  if [[ "$COMPRESS_PROFILE" == "youtube-compact" ]]; then
+    video_bitrate="24.000"
+  elif [[ -z "$COMPRESS_PROFILE" ]]; then
+    local first_bitrate
+    first_bitrate="$(stream_value "$first" "v:0" "bit_rate")"
+    if [[ "$first_bitrate" =~ '^[0-9]+$' ]]; then
+      video_bitrate="$(awk -v recommended="$video_bitrate" -v source="$first_bitrate" 'BEGIN {
+        source = source / 1000000
+        printf "%.3f", (source > recommended ? source : recommended)
+      }')"
+    fi
+  fi
+  if awk -v fps="$target_fps" 'BEGIN { exit !(fps > 30.5) }'; then
+    video_bitrate="$(awk -v value="$video_bitrate" 'BEGIN { printf "%.3f", value * 1.5 }')"
+  fi
+  maxrate="$(awk -v value="$video_bitrate" 'BEGIN { printf "%.3f", value * 1.15 }')"
+  bufsize="$(awk -v value="$video_bitrate" 'BEGIN { printf "%.3f", value * 2 }')"
+
+  local -a video_args
+  if [[ "$USE_SOFTWARE" == "0" ]] && ffmpeg -hide_banner -h "encoder=${output_codec}_videotoolbox" >/dev/null 2>&1; then
+    video_encoder="${output_codec}_videotoolbox"
+    encoder_label="Apple VideoToolbox"
+    video_args=(-c:v "$video_encoder" -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -allow_sw 1)
+  else
+    if [[ "$output_codec" == "hevc" ]]; then
+      video_encoder="libx265"
+      encoder_label="CPU libx265"
+      video_args=(-c:v "$video_encoder" -preset medium -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -pix_fmt yuv420p -tag:v hvc1)
+    else
+      video_encoder="libx264"
+      encoder_label="CPU libx264"
+      video_args=(-c:v "$video_encoder" -preset medium -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -pix_fmt yuv420p)
+    fi
+  fi
+
+  local temp_output="${output%.*}.tmp.$$.mp4"
+  local error_log
+  error_log="$(mktemp -t video-editor-join.XXXXXX)"
+  local progress_pipe
+  progress_pipe="$(mktemp -u -t video-editor-join-progress.XXXXXX)"
+  mkfifo "$progress_pipe"
+  TMP_FILES+=("$temp_output" "$error_log" "$progress_pipe")
+
+  echo "Роликов:       ${#inputs[@]}"
+  echo "Исходник:      роликов ${#inputs[@]}, первый ${first_width}x${first_height}, $first_codec"
+  echo "Длительность:  $(format_time "$total_duration")"
+  echo "Профиль:       $profile_label"
+  echo "Разрешение:    ${target_width}x${target_height}, ${target_fps} fps"
+  echo "Видео:         ${output_codec:u}, $encoder_label, ${video_bitrate} Мбит/с"
+  if [[ "$video_encoder" == *_videotoolbox ]]; then
+    echo "Ускорение:     Apple VideoToolbox (аппаратный медиадвижок)"
+  else
+    echo "Ускорение:     CPU (VideoToolbox отключён или недоступен)"
+  fi
+  echo "Аудио:         AAC, 48 кГц, стерео"
+  echo "Результат:     $output"
+
+  local estimated_max_bytes estimated_low_bytes estimated_bytes
+  estimated_max_bytes="$(awk -v duration="$total_duration" -v video="$video_bitrate" \
+    'BEGIN { printf "%.0f", duration * (video + 0.192) / 8 * 1000000 }')"
+  estimated_low_bytes="$(awk -v bytes="$estimated_max_bytes" 'BEGIN { printf "%.0f", bytes * 0.70 }')"
+  estimated_bytes="$(awk -v low="$estimated_low_bytes" -v high="$estimated_max_bytes" \
+    'BEGIN { printf "%.0f", (low + high) / 2 }')"
+  echo "Прогноз размера: $(format_file_size "$estimated_low_bytes")–$(format_file_size "$estimated_max_bytes") (VBR)"
+
+  local started position current_speed current_total_size dynamic_estimate_bytes
+  local resource_values resource_cpu_total resource_cpu_cores resource_ram resource_text
+  local resource_now output_write_rate previous_total_size previous_size_time
+  local current_size_text predicted_size_text resource_display_started
+  local -a resource_fields
+  started="$(date +%s)"
+  position="0"
+  current_speed="--"
+  current_total_size="0"
+  dynamic_estimate_bytes="$estimated_bytes"
+  resource_cpu_total="--"
+  resource_cpu_cores="--"
+  resource_ram="--"
+  output_write_rate="--"
+  previous_total_size="0"
+  previous_size_time="$started"
+  resource_display_started=0
+
+  set +e
+  ffmpeg \
+    -hide_banner \
+    -y \
+    -nostdin \
+    -nostats \
+    -stats_period 1 \
+    -progress "$progress_pipe" \
+    "${input_args[@]}" \
+    -filter_complex "$filter_complex" \
+    -map "[outv]" \
+    -map "[outa]" \
+    "${video_args[@]}" \
+    -c:a aac \
+    -b:a 192k \
+    -ar 48000 \
+    -ac 2 \
+    -map_metadata -1 \
+    -map_chapters -1 \
+    -movflags +faststart \
+    "$temp_output" >/dev/null 2>"$error_log" &
+  FFMPEG_PID="$!"
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      out_time_us)
+        if [[ "$value" =~ '^[0-9]+$' ]]; then
+          position="$(awk -v value="$value" 'BEGIN { printf "%.6f", value / 1000000 }')"
+        fi
+        ;;
+      speed)
+        current_speed="$value"
+        ;;
+      total_size)
+        if [[ "$value" =~ '^[0-9]+$' ]]; then
+          current_total_size="$value"
+        fi
+        ;;
+      progress)
+        [[ "$value" == "end" ]] && position="$total_duration"
+        current_size_text=""
+        predicted_size_text=""
+        if [[ "$current_total_size" =~ '^[0-9]+$' && "$current_total_size" != "0" ]]; then
+          current_size_text="$(format_file_size "$current_total_size")"
+          if [[ "$value" == "end" ]]; then
+            dynamic_estimate_bytes="$current_total_size"
+          elif awk -v position="$position" -v target="$total_duration" \
+            'BEGIN { exit !(position > 0 && target > 0) }'; then
+            dynamic_estimate_bytes="$(smooth_size_estimate "$estimated_bytes" \
+              "$dynamic_estimate_bytes" "$current_total_size" "$position" "$total_duration")"
+          fi
+          predicted_size_text="$(format_file_size "$dynamic_estimate_bytes")"
+        fi
+
+        resource_now="$(date +%s)"
+        if [[ "$current_total_size" =~ '^[0-9]+$' ]] && \
+          (( resource_now > previous_size_time )) && \
+          (( current_total_size >= previous_total_size )); then
+          output_write_rate="$(awk -v current="$current_total_size" -v previous="$previous_total_size" \
+            -v now="$resource_now" -v before="$previous_size_time" \
+            'BEGIN { printf "%.1f", (current - previous) / (now - before) / 1000000 }')"
+          previous_total_size="$current_total_size"
+          previous_size_time="$resource_now"
+        fi
+
+        resource_values="$(ps -p "$FFMPEG_PID" -o %cpu= -o rss= 2>/dev/null | \
+          awk -v cores="$LOGICAL_CPUS" 'NR == 1 {
+            total = $1 / cores
+            if (total > 100) total = 100
+            printf "%.0f %.1f %.1f", total, $1 / 100, $2 / 1024
+        }')"
+        if [[ -n "$resource_values" ]]; then
+          resource_fields=("${(@s: :)resource_values}")
+          resource_cpu_total="${resource_fields[1]}"
+          resource_cpu_cores="${resource_fields[2]}"
+          resource_ram="${resource_fields[3]}"
+        fi
+        resource_text="CPU ${resource_cpu_total}% (${resource_cpu_cores}/${LOGICAL_CPUS}) | RAM ${resource_ram} МБ / ${TOTAL_RAM_TEXT} | $encoder_label"
+        if [[ "$output_write_rate" != "--" ]]; then
+          resource_text+=" | запись ${output_write_rate} МБ/с"
+        fi
+        if [[ "$PLAIN_PROGRESS" == "1" ]]; then
+          printf "Ресурсы: %s\n" "$resource_text"
+        elif [[ "$resource_display_started" == "0" ]]; then
+          printf "\r\033[2KРесурсы: %s\n" "$resource_text"
+          resource_display_started=1
+        else
+          printf "\r\033[1A\033[2K\rРесурсы: %s\n" "$resource_text"
+        fi
+        print_progress "$started" "$total_duration" "$position" "Склейка" \
+          "$current_speed" "$current_size_text" "$predicted_size_text"
+        ;;
+    esac
+  done < "$progress_pipe"
+
+  wait "$FFMPEG_PID"
+  local ffmpeg_status="$?"
+  FFMPEG_PID=""
+  rm -f "$progress_pipe"
+  set -e
+  echo
+
+  if [[ "$ffmpeg_status" != "0" ]]; then
+    echo "Ошибка ffmpeg:" >&2
+    sed -n '1,180p' "$error_log" >&2
+    return "$ffmpeg_status"
+  fi
+
+  mv -f "$temp_output" "$output"
+  echo "Готово: $output"
+  local final_bytes
+  final_bytes="$(stat -f "%z" "$output" 2>/dev/null || true)"
+  [[ -n "$final_bytes" ]] && echo "Итоговый размер: $(format_file_size "$final_bytes")"
+}
+
+if (( $# > 0 )); then
+  case "$1" in
+    cut)
+      COMMAND="cut"
+      shift
+      ;;
+    compress)
+      COMMAND="compress"
+      shift
+      if (( $# > 0 )); then
+        case "${1:l}" in
+          240|240p|360|360p|480|480p|720|720p|1080|1080p|1440|1440p|2160|2160p)
+            COMPRESS_PROFILE="${1:l}"
+            COMPRESS_PROFILE="${COMPRESS_PROFILE%p}"
+            shift
+            ;;
+          youtube|youtube-4k)
+            COMPRESS_PROFILE="youtube"
+            shift
+            ;;
+          youtube-compact|compact-4k)
+            COMPRESS_PROFILE="youtube-compact"
+            shift
+            ;;
+        esac
+      fi
+      ;;
+    join)
+      COMMAND="join"
+      shift
+      ;;
+    help)
+      usage
+      exit 0
+      ;;
+  esac
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    -f|--file)
+      (( $# >= 2 )) || die "после $1 нужно указать файл"
+      INPUT_RAW="$2"
+      shift 2
+      ;;
+    -s|--start)
+      (( $# >= 2 )) || die "после $1 нужно указать время"
+      START_RAW="$2"
+      shift 2
+      ;;
+    -e|--end)
+      (( $# >= 2 )) || die "после $1 нужно указать время"
+      END_RAW="$2"
+      shift 2
+      ;;
+    -p|--profile|--preset)
+      (( $# >= 2 )) || die "после $1 нужно указать профиль"
+      COMPRESS_PROFILE="${2:l}"
+      shift 2
+      ;;
+    -c|--codec)
+      (( $# >= 2 )) || die "после $1 нужно указать кодек"
+      CODEC_RAW="${2:l}"
+      shift 2
+      ;;
+    -b|--bitrate)
+      (( $# >= 2 )) || die "после $1 нужно указать битрейт"
+      BITRATE_RAW="$2"
+      shift 2
+      ;;
+    --software|--no-gpu|--cpu)
+      USE_SOFTWARE=1
+      shift
+      ;;
+    --plain-progress)
+      PLAIN_PROGRESS=1
+      shift
+      ;;
+    --manifest)
+      (( $# >= 2 )) || die "после $1 нужно указать файл"
+      MANIFEST_RAW="$2"
+      shift 2
+      ;;
+    -o|--output)
+      (( $# >= 2 )) || die "после $1 нужно указать файл"
+      OUTPUT_RAW="$2"
+      shift 2
+      ;;
+    -y|--overwrite)
+      OVERWRITE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      die "неизвестный параметр: $1 (справка: video_editor --help)"
+      ;;
+    *)
+      if [[ -z "$INPUT_RAW" ]]; then
+        INPUT_RAW="$1"
+        shift
+      else
+        die "лишний аргумент: $1"
+      fi
+      ;;
+  esac
+done
+
+if [[ "$COMMAND" == "compress" && -z "$COMPRESS_PROFILE" ]]; then
+  die "не указан профиль. Например: video_editor compress 1080 -f \"файл.mp4\""
+fi
+
+if [[ "$COMMAND" != "join" && -z "$INPUT_RAW" ]]; then
+  read "INPUT_RAW?Файл: "
+fi
+if [[ "$COMMAND" != "join" ]]; then
+  [[ -n "$INPUT_RAW" ]] || die "файл не указан"
+fi
+
+need_tool ffmpeg
+need_tool ffprobe
+need_tool awk
+need_tool sed
+need_tool mkfifo
+need_tool ps
+need_tool sysctl
+
+LOGICAL_CPUS="$(sysctl -n hw.logicalcpu 2>/dev/null || true)"
+[[ "$LOGICAL_CPUS" =~ '^[0-9]+$' && "$LOGICAL_CPUS" -gt 0 ]] || LOGICAL_CPUS="1"
+TOTAL_RAM_BYTES="$(sysctl -n hw.memsize 2>/dev/null || true)"
+if [[ "$TOTAL_RAM_BYTES" =~ '^[0-9]+$' && "$TOTAL_RAM_BYTES" -gt 0 ]]; then
+  TOTAL_RAM_TEXT="$(awk -v bytes="$TOTAL_RAM_BYTES" 'BEGIN { printf "%.0f ГБ", bytes / 1073741824 }')"
+else
+  TOTAL_RAM_TEXT="--"
+fi
+
+if [[ "$COMMAND" == "join" ]]; then
+  run_join
+  exit 0
+fi
+
+INPUT="$(resolve_input "$INPUT_RAW")"
+[[ -f "$INPUT" ]] || die "файл не найден: $INPUT_RAW"
+
+SOURCE_DURATION="$(media_duration "$INPUT")"
+[[ -n "$SOURCE_DURATION" && "$SOURCE_DURATION" != "N/A" ]] || \
+  die "не удалось определить длительность файла"
+
+INPUT_DIR="${INPUT:h}"
+INPUT_NAME="${INPUT:t}"
+
+if [[ "$INPUT_NAME" == *.* ]]; then
+  STEM="${INPUT_NAME%.*}"
+  EXTENSION="${INPUT_NAME##*.}"
+else
+  STEM="$INPUT_NAME"
+  EXTENSION="mkv"
+fi
+
+if [[ "$COMMAND" == "compress" ]]; then
+  TRIM_ACTIVE=0
+  INPUT_SEEK_ARGS=()
+  INPUT_DURATION_ARGS=()
+  if [[ -n "$START_RAW" || -n "$END_RAW" ]]; then
+    [[ -n "$START_RAW" && -n "$END_RAW" ]] || \
+      die "для сжатия фрагмента укажите одновременно -s и -e"
+    ORIGINAL_SOURCE_DURATION="$SOURCE_DURATION"
+    TRIM_START_SECONDS="$(parse_time "$START_RAW")" || die "неверное время старта: $START_RAW"
+    TRIM_END_SECONDS="$(parse_time "$END_RAW")" || die "неверное время конца: $END_RAW"
+    awk -v start="$TRIM_START_SECONDS" -v end="$TRIM_END_SECONDS" \
+      -v duration="$ORIGINAL_SOURCE_DURATION" \
+      'BEGIN { exit !(start >= 0 && end > start && end <= duration + 0.001) }' || \
+      die "границы фрагмента находятся за пределами файла"
+    SOURCE_DURATION="$(awk -v start="$TRIM_START_SECONDS" -v end="$TRIM_END_SECONDS" \
+      'BEGIN { printf "%.6f", end - start }')"
+    INPUT_SEEK_ARGS=(-ss "$TRIM_START_SECONDS")
+    INPUT_DURATION_ARGS=(-t "$SOURCE_DURATION")
+    TRIM_ACTIVE=1
+  fi
+
+  SOURCE_VIDEO_CODEC="$(stream_value "$INPUT" "v:0" "codec_name")"
+  [[ -n "$SOURCE_VIDEO_CODEC" ]] || die "в файле нет видеодорожки"
+  SOURCE_AUDIO_CODEC="$(stream_value "$INPUT" "a:0" "codec_name")"
+  SOURCE_AUDIO_BITRATE="$(stream_value "$INPUT" "a:0" "bit_rate")"
+  SOURCE_WIDTH="$(stream_value "$INPUT" "v:0" "width")"
+  SOURCE_HEIGHT="$(stream_value "$INPUT" "v:0" "height")"
+  SOURCE_PIX_FMT="$(stream_value "$INPUT" "v:0" "pix_fmt")"
+  SOURCE_COLOR_TRANSFER="$(stream_value "$INPUT" "v:0" "color_transfer")"
+  SOURCE_VIDEO_BITRATE="$(stream_value "$INPUT" "v:0" "bit_rate")"
+  SOURCE_FPS_RAW="$(stream_value "$INPUT" "v:0" "avg_frame_rate")"
+  SOURCE_FPS="$(awk -v rate="$SOURCE_FPS_RAW" 'BEGIN {
+    split(rate, part, "/")
+    value = part[2] > 0 ? part[1] / part[2] : part[1]
+    if (value <= 0) value = 30
+    printf "%.3f", value
+  }')"
+  if [[ -z "$SOURCE_VIDEO_BITRATE" || "$SOURCE_VIDEO_BITRATE" == "N/A" || "$SOURCE_VIDEO_BITRATE" == "0" ]]; then
+    SOURCE_VIDEO_BITRATE="$(
+      ffprobe -v error \
+        -show_entries format=bit_rate \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$INPUT" 2>/dev/null
+    )"
+  fi
+
+  HIGH_FPS=0
+  if awk -v fps="$SOURCE_FPS" 'BEGIN { exit !(fps > 30.5) }'; then
+    HIGH_FPS=1
+    FPS_LABEL="50/60 fps"
+  else
+    FPS_LABEL="24/25/30 fps"
+  fi
+
+  case "$COMPRESS_PROFILE" in
+    240|240p)
+      COMPRESS_PROFILE="240"
+      TARGET_SHORT_SIDE="240"
+      H264_STANDARD_BITRATE="0.600"
+      H264_HIGH_BITRATE="0.900"
+      AUDIO_BITRATE_KBPS="96"
+      H264_LEVEL="3.1"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="240p SDR"
+      OUTPUT_SUFFIX="240p"
+      ;;
+    360|360p)
+      COMPRESS_PROFILE="360"
+      TARGET_SHORT_SIDE="360"
+      H264_STANDARD_BITRATE="1.000"
+      H264_HIGH_BITRATE="1.500"
+      AUDIO_BITRATE_KBPS="96"
+      H264_LEVEL="3.1"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="360p SDR"
+      OUTPUT_SUFFIX="360p"
+      ;;
+    480|480p)
+      COMPRESS_PROFILE="480"
+      TARGET_SHORT_SIDE="480"
+      H264_STANDARD_BITRATE="2.500"
+      H264_HIGH_BITRATE="4.000"
+      AUDIO_BITRATE_KBPS="128"
+      H264_LEVEL="3.1"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="480p SDR"
+      OUTPUT_SUFFIX="480p"
+      ;;
+    720|720p)
+      COMPRESS_PROFILE="720"
+      TARGET_SHORT_SIDE="720"
+      H264_STANDARD_BITRATE="5.000"
+      H264_HIGH_BITRATE="7.500"
+      AUDIO_BITRATE_KBPS="128"
+      H264_LEVEL="4.0"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="720p HD SDR"
+      OUTPUT_SUFFIX="720p"
+      ;;
+    1080|1080p)
+      COMPRESS_PROFILE="1080"
+      TARGET_SHORT_SIDE="1080"
+      H264_STANDARD_BITRATE="8.000"
+      H264_HIGH_BITRATE="12.000"
+      AUDIO_BITRATE_KBPS="192"
+      H264_LEVEL="4.2"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="1080p Full HD SDR"
+      OUTPUT_SUFFIX="1080p"
+      ;;
+    1440|1440p)
+      COMPRESS_PROFILE="1440"
+      TARGET_SHORT_SIDE="1440"
+      H264_STANDARD_BITRATE="16.000"
+      H264_HIGH_BITRATE="24.000"
+      AUDIO_BITRATE_KBPS="192"
+      H264_LEVEL="5.0"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="1440p QHD SDR"
+      OUTPUT_SUFFIX="1440p"
+      ;;
+    2160|2160p)
+      COMPRESS_PROFILE="2160"
+      TARGET_SHORT_SIDE="2160"
+      H264_STANDARD_BITRATE="40.000"
+      H264_HIGH_BITRATE="60.000"
+      AUDIO_BITRATE_KBPS="192"
+      H264_LEVEL="5.2"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="2160p 4K SDR"
+      OUTPUT_SUFFIX="2160p"
+      ;;
+    youtube|youtube-4k)
+      COMPRESS_PROFILE="youtube"
+      TARGET_SHORT_SIDE="2160"
+      H264_STANDARD_BITRATE="40.000"
+      H264_HIGH_BITRATE="60.000"
+      AUDIO_BITRATE_KBPS="192"
+      H264_LEVEL="5.2"
+      PRESET_CODEC="h264"
+      PRESET_LABEL="YouTube 4K SDR"
+      OUTPUT_SUFFIX="youtube"
+      ;;
+    youtube-compact|compact-4k)
+      COMPRESS_PROFILE="youtube-compact"
+      TARGET_SHORT_SIDE="2160"
+      H264_STANDARD_BITRATE="40.000"
+      H264_HIGH_BITRATE="60.000"
+      AUDIO_BITRATE_KBPS="192"
+      H264_LEVEL="5.2"
+      PRESET_CODEC="hevc"
+      PRESET_LABEL="YouTube компактный 4K SDR"
+      OUTPUT_SUFFIX="youtube-compact"
+      ;;
+    *)
+      die "неизвестный профиль: $COMPRESS_PROFILE (доступны 240, 360, 480, 720, 1080, 1440, 2160, youtube)"
+      ;;
+  esac
+
+  if [[ "$HIGH_FPS" == "1" ]]; then
+    H264_PROFILE_BITRATE="$H264_HIGH_BITRATE"
+  else
+    H264_PROFILE_BITRATE="$H264_STANDARD_BITRATE"
+  fi
+  HEVC_PROFILE_BITRATE="$(awk -v bitrate="$H264_PROFILE_BITRATE" \
+    'BEGIN { printf "%.3f", bitrate * 0.60 }')"
+
+  VIDEO_CODEC="${CODEC_RAW:-$PRESET_CODEC}"
+  case "$VIDEO_CODEC" in
+    h264|hevc) ;;
+    *) die "кодек должен быть h264 или hevc" ;;
+  esac
+
+  if [[ -n "$BITRATE_RAW" ]]; then
+    VIDEO_BITRATE="$(normalize_bitrate "$BITRATE_RAW")" || \
+      die "неверный битрейт: $BITRATE_RAW"
+  elif [[ "$VIDEO_CODEC" == "h264" ]]; then
+    VIDEO_BITRATE="$(normalize_bitrate "$H264_PROFILE_BITRATE")"
+  else
+    VIDEO_BITRATE="$(normalize_bitrate "$HEVC_PROFILE_BITRATE")"
+  fi
+
+  SOURCE_SHORT_SIDE="$(awk -v width="$SOURCE_WIDTH" -v height="$SOURCE_HEIGHT" \
+    'BEGIN { print (width < height ? width : height) }')"
+  if ! awk -v source="$SOURCE_SHORT_SIDE" -v target="$TARGET_SHORT_SIDE" \
+    'BEGIN { exit !(source >= target) }'; then
+    echo "Файл плохого качества для профиля $COMPRESS_PROFILE:" >&2
+    echo "  разрешение ${SOURCE_WIDTH}x${SOURCE_HEIGHT}, короткая сторона ${SOURCE_SHORT_SIDE}px." >&2
+    echo "  профиль требует не менее ${TARGET_SHORT_SIDE}px." >&2
+    die "увеличивать разрешение искусственно не буду"
+  fi
+
+  TARGET_DIMENSIONS="$(awk -v width="$SOURCE_WIDTH" -v height="$SOURCE_HEIGHT" \
+    -v target="$TARGET_SHORT_SIDE" 'BEGIN {
+      if (width >= height) {
+        out_height = target
+        out_width = int((width * target / height) / 2 + 0.5) * 2
+      } else {
+        out_width = target
+        out_height = int((height * target / width) / 2 + 0.5) * 2
+      }
+      printf "%d %d", out_width, out_height
+    }')"
+  TARGET_WIDTH="${TARGET_DIMENSIONS%% *}"
+  TARGET_HEIGHT="${TARGET_DIMENSIONS##* }"
+  FILTER_ARGS=()
+  if [[ "$TARGET_WIDTH" != "$SOURCE_WIDTH" || "$TARGET_HEIGHT" != "$SOURCE_HEIGHT" ]]; then
+    FILTER_ARGS=(-vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:flags=lanczos")
+    SCALE_LABEL="${TARGET_WIDTH}x${TARGET_HEIGHT}, Lanczos"
+  else
+    SCALE_LABEL="${TARGET_WIDTH}x${TARGET_HEIGHT}, без масштабирования"
+  fi
+
+  case "$SOURCE_COLOR_TRANSFER" in
+    smpte2084|arib-std-b67)
+      echo "Файл не подходит для профиля $COMPRESS_PROFILE: обнаружен HDR." >&2
+      die "этот профиль предназначен для SDR и мог бы испортить цвета"
+      ;;
+  esac
+
+  if [[ "$SOURCE_PIX_FMT" == *10* || "$SOURCE_PIX_FMT" == *12* ]]; then
+    echo "Файл не подходит для профиля $COMPRESS_PROFILE: обнаружено $SOURCE_PIX_FMT." >&2
+    die "8-битный профиль мог бы ухудшить цвет, конвертация отменена"
+  fi
+
+  if [[ -z "$SOURCE_VIDEO_BITRATE" || "$SOURCE_VIDEO_BITRATE" == "N/A" || "$SOURCE_VIDEO_BITRATE" == "0" ]]; then
+    die "не удалось определить исходный видеобитрейт; безопасная конвертация отменена"
+  fi
+
+  SOURCE_BITRATE_MBPS="$(awk -v bitrate="$SOURCE_VIDEO_BITRATE" \
+    'BEGIN { printf "%.3f", bitrate / 1000000 }')"
+  QUALITY_FACTOR="1"
+  if [[ "$SOURCE_VIDEO_CODEC" == "h264" && "$VIDEO_CODEC" == "hevc" ]]; then
+    QUALITY_FACTOR="1.45"
+  elif [[ "$SOURCE_VIDEO_CODEC" == "hevc" && "$VIDEO_CODEC" == "h264" ]]; then
+    QUALITY_FACTOR="0.60"
+  elif [[ "$SOURCE_VIDEO_CODEC" == "av1" && "$VIDEO_CODEC" == "h264" ]]; then
+    QUALITY_FACTOR="0.50"
+  elif [[ "$SOURCE_VIDEO_CODEC" == "av1" && "$VIDEO_CODEC" == "hevc" ]]; then
+    QUALITY_FACTOR="0.80"
+  fi
+  REQUIRED_SOURCE_BITRATE="$(awk -v bitrate="$VIDEO_BITRATE" -v factor="$QUALITY_FACTOR" \
+    'BEGIN { printf "%.3f", bitrate * factor }')"
+
+  if ! awk -v source="$SOURCE_BITRATE_MBPS" -v required="$REQUIRED_SOURCE_BITRATE" \
+    'BEGIN { exit !(source > required) }'; then
+    echo "Файл плохого качества для профиля $COMPRESS_PROFILE:" >&2
+    echo "  исходный кодек: $SOURCE_VIDEO_CODEC" >&2
+    echo "  исходный битрейт: ${SOURCE_BITRATE_MBPS} Мбит/с" >&2
+    echo "  требуется больше: ${REQUIRED_SOURCE_BITRATE} Мбит/с" >&2
+    die "повторное кодирование не улучшит качество и поэтому отменено"
+  fi
+
+  GOP_SIZE="$(awk -v fps="$SOURCE_FPS" 'BEGIN {
+    value = int(fps / 2 + 0.5)
+    if (value < 1) value = 1
+    printf "%d", value
+  }')"
+  MAX_BITRATE="$(awk -v bitrate="$VIDEO_BITRATE" 'BEGIN { printf "%.3f", bitrate * 1.125 }')"
+  BUFFER_SIZE="$(awk -v bitrate="$VIDEO_BITRATE" 'BEGIN { printf "%.3f", bitrate * 2 }')"
+
+  if [[ -n "$OUTPUT_RAW" ]]; then
+    if [[ "$OUTPUT_RAW" == */* ]]; then
+      OUTPUT="${OUTPUT_RAW:A}"
+    else
+      OUTPUT="$INPUT_DIR/$OUTPUT_RAW"
+    fi
+  else
+    OUTPUT="$INPUT_DIR/$STEM.$OUTPUT_SUFFIX.mp4"
+  fi
+  [[ "${OUTPUT:l}" == *.mp4 ]] || die "для сжатия укажите выходной файл с расширением .mp4"
+  OUTPUT="$(unique_output_path "$OUTPUT")"
+  OUTPUT_DIR="${OUTPUT:h}"
+  [[ -d "$OUTPUT_DIR" ]] || die "папка результата не существует: $OUTPUT_DIR"
+
+  TEMP_OUTPUT="${OUTPUT%.*}.tmp.$$.mp4"
+  ERROR_LOG="$(mktemp -t video-editor-compress.XXXXXX)"
+  TMP_FILES+=("$TEMP_OUTPUT" "$ERROR_LOG")
+
+  if [[ "$USE_SOFTWARE" == "0" ]]; then
+    [[ "$VIDEO_CODEC" == "h264" ]] && \
+      HARDWARE_ENCODER="h264_videotoolbox" || HARDWARE_ENCODER="hevc_videotoolbox"
+
+    set +e
+    ffmpeg \
+      -v error \
+      -nostdin \
+      -i "$INPUT" \
+      -map "0:v:0" \
+      "${FILTER_ARGS[@]}" \
+      -frames:v 1 \
+      -c:v "$HARDWARE_ENCODER" \
+      -allow_sw 1 \
+      -b:v "${VIDEO_BITRATE}M" \
+      -pix_fmt yuv420p \
+      -f null - >/dev/null 2>&1
+    HARDWARE_TEST_STATUS="$?"
+    set -e
+
+    if [[ "$HARDWARE_TEST_STATUS" != "0" ]]; then
+      echo "VideoToolbox не смог открыть ${TARGET_WIDTH}x${TARGET_HEIGHT}; использую процессор."
+      USE_SOFTWARE=1
+    fi
+  fi
+
+  VIDEO_ARGS=()
+  if [[ "$VIDEO_CODEC" == "h264" ]]; then
+    if [[ "$USE_SOFTWARE" == "1" ]]; then
+      VIDEO_ENCODER="libx264"
+      ENCODER_LABEL="H.264, процессор"
+      VIDEO_ARGS=(
+        -c:v libx264
+        -preset medium
+        -profile:v high
+        -level:v "$H264_LEVEL"
+        -b:v "${VIDEO_BITRATE}M"
+        -maxrate "${MAX_BITRATE}M"
+        -bufsize "${BUFFER_SIZE}M"
+        -g "$GOP_SIZE"
+        -keyint_min "$GOP_SIZE"
+        -sc_threshold 0
+        -bf 2
+        -pix_fmt yuv420p
+      )
+    else
+      VIDEO_ENCODER="h264_videotoolbox"
+      ENCODER_LABEL="H.264, VideoToolbox"
+      VIDEO_ARGS=(
+        -c:v h264_videotoolbox
+        -profile:v high
+        -allow_sw 1
+        -b:v "${VIDEO_BITRATE}M"
+        -maxrate "${MAX_BITRATE}M"
+        -bufsize "${BUFFER_SIZE}M"
+        -pix_fmt yuv420p
+        -spatial_aq 1
+      )
+    fi
+  else
+    if [[ "$USE_SOFTWARE" == "1" ]]; then
+      VIDEO_ENCODER="libx265"
+      ENCODER_LABEL="HEVC, процессор"
+      VIDEO_ARGS=(
+        -c:v libx265
+        -preset medium
+        -profile:v main
+        -b:v "${VIDEO_BITRATE}M"
+        -maxrate "${MAX_BITRATE}M"
+        -bufsize "${BUFFER_SIZE}M"
+        -g "$GOP_SIZE"
+        -pix_fmt yuv420p
+        -tag:v hvc1
+      )
+    else
+      VIDEO_ENCODER="hevc_videotoolbox"
+      ENCODER_LABEL="HEVC, VideoToolbox"
+      VIDEO_ARGS=(
+        -c:v hevc_videotoolbox
+        -profile:v main
+        -allow_sw 1
+        -b:v "${VIDEO_BITRATE}M"
+        -maxrate "${MAX_BITRATE}M"
+        -bufsize "${BUFFER_SIZE}M"
+        -g "$GOP_SIZE"
+        -pix_fmt yuv420p
+        -spatial_aq 1
+        -tag:v hvc1
+      )
+    fi
+  fi
+
+  ffmpeg -hide_banner -h "encoder=$VIDEO_ENCODER" >/dev/null 2>&1 || \
+    die "кодировщик $VIDEO_ENCODER недоступен в установленном FFmpeg"
+
+  AUDIO_ARGS=(-map "0:a:0?")
+  if [[ -z "$SOURCE_AUDIO_CODEC" ]]; then
+    AUDIO_LABEL="нет аудиодорожки"
+  elif [[ "$SOURCE_AUDIO_CODEC" == "aac" ]]; then
+    AUDIO_ARGS+=(-c:a copy)
+    AUDIO_LABEL="AAC без повторного кодирования"
+  else
+    AUDIO_ARGS+=(-c:a aac -b:a "${AUDIO_BITRATE_KBPS}k" -ar 48000)
+    AUDIO_LABEL="AAC-LC ${AUDIO_BITRATE_KBPS} кбит/с"
+  fi
+
+  if [[ "$USE_SOFTWARE" == "1" ]]; then
+    ACCELERATION_LABEL="CPU (VideoToolbox отключён или недоступен)"
+  else
+    ACCELERATION_LABEL="Apple VideoToolbox (аппаратный медиадвижок)"
+  fi
+
+  echo "Источник:       $INPUT"
+  echo "Исходник:       ${SOURCE_WIDTH}x${SOURCE_HEIGHT}, ${SOURCE_FPS} fps, $SOURCE_VIDEO_CODEC"
+  if [[ "$TRIM_ACTIVE" == "1" ]]; then
+    echo "Фрагмент:       $(format_time "$TRIM_START_SECONDS")–$(format_time "$TRIM_END_SECONDS")"
+  fi
+  echo "Длительность:   $(format_time "$SOURCE_DURATION")"
+  echo "Профиль:        $PRESET_LABEL ($FPS_LABEL)"
+  echo "Разрешение:     $SCALE_LABEL"
+  echo "Видео:          $ENCODER_LABEL, ${VIDEO_BITRATE} Мбит/с"
+  echo "Ускорение:      $ACCELERATION_LABEL"
+  echo "Аудио:          $AUDIO_LABEL"
+  echo "Результат:      $OUTPUT"
+
+  if [[ -z "$SOURCE_AUDIO_CODEC" ]]; then
+    ESTIMATED_AUDIO_MBPS="0"
+  elif [[ "$SOURCE_AUDIO_CODEC" == "aac" && -n "$SOURCE_AUDIO_BITRATE" && "$SOURCE_AUDIO_BITRATE" != "N/A" ]]; then
+    ESTIMATED_AUDIO_MBPS="$(awk -v bitrate="$SOURCE_AUDIO_BITRATE" \
+      'BEGIN { printf "%.6f", bitrate / 1000000 }')"
+  else
+    ESTIMATED_AUDIO_MBPS="$(awk -v bitrate="$AUDIO_BITRATE_KBPS" \
+      'BEGIN { printf "%.6f", bitrate / 1000 }')"
+  fi
+
+  ESTIMATE_READY=0
+  if [[ "$TRIM_ACTIVE" == "0" && "$USE_SOFTWARE" == "0" ]] && \
+    awk -v duration="$SOURCE_DURATION" 'BEGIN { exit !(duration >= 30) }'; then
+    SAMPLE_DURATION="6"
+    SAMPLE_TOTAL_BYTES=0
+    SAMPLE_TOTAL_DURATION="0"
+    SAMPLE_SUCCESS_COUNT=0
+    echo "Оценка размера: анализирую 3 коротких участка ролика..."
+
+    for SAMPLE_INDEX in 1 2 3; do
+      case "$SAMPLE_INDEX" in
+        1) SAMPLE_FRACTION="0.10" ;;
+        2) SAMPLE_FRACTION="0.50" ;;
+        3) SAMPLE_FRACTION="0.85" ;;
+      esac
+      SAMPLE_START="$(awk -v duration="$SOURCE_DURATION" -v fraction="$SAMPLE_FRACTION" \
+        -v sample="$SAMPLE_DURATION" 'BEGIN {
+          value = duration * fraction - sample / 2
+          if (value < 0) value = 0
+          if (value + sample > duration) value = duration - sample
+          printf "%.6f", value
+        }')"
+      SAMPLE_FILE="${OUTPUT%.*}.size-sample-${SAMPLE_INDEX}.$$.mp4"
+      TMP_FILES+=("$SAMPLE_FILE")
+
+      set +e
+      ffmpeg \
+        -v error \
+        -y \
+        -nostdin \
+        -ss "$SAMPLE_START" \
+        -i "$INPUT" \
+        -t "$SAMPLE_DURATION" \
+        -map "0:v:0" \
+        -an \
+        "${FILTER_ARGS[@]}" \
+        "${VIDEO_ARGS[@]}" \
+        -fps_mode passthrough \
+        -movflags +faststart \
+        -use_editlist 0 \
+        "$SAMPLE_FILE" >/dev/null 2>&1
+      SAMPLE_STATUS="$?"
+      set -e
+
+      if [[ "$SAMPLE_STATUS" == "0" && -s "$SAMPLE_FILE" ]]; then
+        SAMPLE_BYTES="$(stat -f "%z" "$SAMPLE_FILE")"
+        SAMPLE_ACTUAL_DURATION="$(media_duration "$SAMPLE_FILE")"
+        SAMPLE_TOTAL_BYTES=$((SAMPLE_TOTAL_BYTES + SAMPLE_BYTES))
+        SAMPLE_TOTAL_DURATION="$(awk -v total="$SAMPLE_TOTAL_DURATION" \
+          -v sample="$SAMPLE_ACTUAL_DURATION" 'BEGIN { printf "%.6f", total + sample }')"
+        SAMPLE_SUCCESS_COUNT=$((SAMPLE_SUCCESS_COUNT + 1))
+      fi
+      rm -f "$SAMPLE_FILE"
+    done
+
+    if (( SAMPLE_SUCCESS_COUNT == 3 )); then
+      ESTIMATED_VIDEO_MBPS="$(awk -v bytes="$SAMPLE_TOTAL_BYTES" \
+        -v duration="$SAMPLE_TOTAL_DURATION" \
+        'BEGIN { printf "%.6f", bytes * 8 / duration / 1000000 }')"
+      ESTIMATED_BYTES="$(awk -v duration="$SOURCE_DURATION" \
+        -v video="$ESTIMATED_VIDEO_MBPS" -v audio="$ESTIMATED_AUDIO_MBPS" \
+        'BEGIN { printf "%.0f", duration * (video + audio) / 8 * 1000000 }')"
+      ESTIMATED_LOW_BYTES="$(awk -v bytes="$ESTIMATED_BYTES" 'BEGIN { printf "%.0f", bytes * 0.90 }')"
+      ESTIMATED_HIGH_BYTES="$(awk -v bytes="$ESTIMATED_BYTES" 'BEGIN { printf "%.0f", bytes * 1.10 }')"
+      ESTIMATED_SIZE="$(format_file_size "$ESTIMATED_BYTES")"
+      ESTIMATED_RANGE="$(format_file_size "$ESTIMATED_LOW_BYTES")–$(format_file_size "$ESTIMATED_HIGH_BYTES")"
+      ESTIMATED_VIDEO_DISPLAY="$(awk -v bitrate="$ESTIMATED_VIDEO_MBPS" \
+        'BEGIN { printf "%.3f", bitrate }')"
+      ESTIMATE_READY=1
+      echo "Прогноз размера: ~$ESTIMATED_SIZE (диапазон $ESTIMATED_RANGE)"
+      echo "Пробный VBR:     ${ESTIMATED_VIDEO_DISPLAY} Мбит/с"
+    fi
+  fi
+
+  if [[ "$ESTIMATE_READY" == "0" ]]; then
+    ESTIMATED_MAX_BYTES="$(awk -v duration="$SOURCE_DURATION" \
+      -v video="$VIDEO_BITRATE" -v audio="$ESTIMATED_AUDIO_MBPS" \
+      'BEGIN { printf "%.0f", duration * (video + audio) / 8 * 1000000 }')"
+    ESTIMATED_LOW_BYTES="$(awk -v bytes="$ESTIMATED_MAX_BYTES" 'BEGIN { printf "%.0f", bytes * 0.70 }')"
+    ESTIMATED_BYTES="$(awk -v low="$ESTIMATED_LOW_BYTES" -v high="$ESTIMATED_MAX_BYTES" \
+      'BEGIN { printf "%.0f", (low + high) / 2 }')"
+    echo "Прогноз размера: $(format_file_size "$ESTIMATED_LOW_BYTES")–$(format_file_size "$ESTIMATED_MAX_BYTES") (VBR)"
+  fi
+
+  STARTED="$(date +%s)"
+
+  POSITION="0"
+  CURRENT_SPEED="--"
+  CURRENT_TOTAL_SIZE="0"
+  DYNAMIC_ESTIMATE_BYTES="$ESTIMATED_BYTES"
+  RESOURCE_CPU_TOTAL="--"
+  RESOURCE_CPU_CORES="--"
+  RESOURCE_RAM="--"
+  RESOURCE_DISPLAY_STARTED=0
+  OUTPUT_WRITE_RATE="--"
+  PREVIOUS_TOTAL_SIZE="0"
+  PREVIOUS_SIZE_TIME="$STARTED"
+  if [[ "$USE_SOFTWARE" == "1" ]]; then
+    RESOURCE_ENCODER="кодер CPU"
+  else
+    RESOURCE_ENCODER="Media Engine VT"
+  fi
+
+  PROGRESS_PIPE="$(mktemp -u -t video-editor-progress.XXXXXX)"
+  mkfifo "$PROGRESS_PIPE"
+  TMP_FILES+=("$PROGRESS_PIPE")
+
+  set +e
+  ffmpeg \
+    -hide_banner \
+    -y \
+    -nostdin \
+    -nostats \
+    -stats_period 1 \
+    -progress "$PROGRESS_PIPE" \
+    "${INPUT_SEEK_ARGS[@]}" \
+    -i "$INPUT" \
+    "${INPUT_DURATION_ARGS[@]}" \
+    -map "0:v:0" \
+    "${AUDIO_ARGS[@]}" \
+    -map_metadata -1 \
+    -map_chapters -1 \
+    -sn \
+    -dn \
+    "${FILTER_ARGS[@]}" \
+    "${VIDEO_ARGS[@]}" \
+    -fps_mode passthrough \
+    -movflags +faststart \
+    -use_editlist 0 \
+    "$TEMP_OUTPUT" > /dev/null 2>"$ERROR_LOG" &
+  FFMPEG_PID="$!"
+
+  while IFS='=' read -r key value; do
+      case "$key" in
+        out_time_us)
+          if [[ "$value" =~ '^[0-9]+$' ]]; then
+            POSITION="$(awk -v value="$value" 'BEGIN { printf "%.6f", value / 1000000 }')"
+          fi
+          ;;
+        speed)
+          CURRENT_SPEED="$value"
+          ;;
+        total_size)
+          if [[ "$value" =~ '^[0-9]+$' ]]; then
+            CURRENT_TOTAL_SIZE="$value"
+          fi
+          ;;
+        progress)
+          [[ "$value" == "end" ]] && POSITION="$SOURCE_DURATION"
+          CURRENT_SIZE_TEXT=""
+          PREDICTED_SIZE_TEXT=""
+          if [[ "$CURRENT_TOTAL_SIZE" =~ '^[0-9]+$' && "$CURRENT_TOTAL_SIZE" != "0" ]]; then
+            CURRENT_SIZE_TEXT="$(format_file_size "$CURRENT_TOTAL_SIZE")"
+
+            if [[ "$value" == "end" ]]; then
+              DYNAMIC_ESTIMATE_BYTES="$CURRENT_TOTAL_SIZE"
+            elif awk -v position="$POSITION" -v target="$SOURCE_DURATION" \
+              'BEGIN { exit !(position > 0 && target > 0) }'; then
+              DYNAMIC_ESTIMATE_BYTES="$(awk \
+                -v prior="$ESTIMATED_BYTES" \
+                -v previous="$DYNAMIC_ESTIMATE_BYTES" \
+                -v bytes="$CURRENT_TOTAL_SIZE" \
+                -v position="$POSITION" \
+                -v target="$SOURCE_DURATION" 'BEGIN {
+                  progress = position / target
+                  raw = bytes * target / position
+
+                  if (progress <= 0.05) {
+                    blended = prior
+                  } else {
+                    normalized = (progress - 0.05) / 0.95
+                    if (normalized > 1) normalized = 1
+                    weight = normalized ^ 0.80
+
+                    if (normalized < 0.35) {
+                      lower = prior * 0.65
+                      upper = prior * 1.35
+                      if (raw < lower) raw = lower
+                      if (raw > upper) raw = upper
+                    }
+
+                    blended = prior * (1 - weight) + raw * weight
+                  }
+
+                  smoothed = previous * 0.80 + blended * 0.20
+                  printf "%.0f", smoothed
+                }')"
+            fi
+
+            PREDICTED_SIZE_TEXT="$(format_file_size "$DYNAMIC_ESTIMATE_BYTES")"
+          fi
+
+          RESOURCE_NOW="$(date +%s)"
+          if [[ "$CURRENT_TOTAL_SIZE" =~ '^[0-9]+$' ]] && \
+            (( RESOURCE_NOW > PREVIOUS_SIZE_TIME )) && \
+            (( CURRENT_TOTAL_SIZE >= PREVIOUS_TOTAL_SIZE )); then
+            OUTPUT_WRITE_RATE="$(awk \
+              -v current="$CURRENT_TOTAL_SIZE" \
+              -v previous="$PREVIOUS_TOTAL_SIZE" \
+              -v now="$RESOURCE_NOW" \
+              -v before="$PREVIOUS_SIZE_TIME" \
+              'BEGIN { printf "%.1f", (current - previous) / (now - before) / 1000000 }')"
+            PREVIOUS_TOTAL_SIZE="$CURRENT_TOTAL_SIZE"
+            PREVIOUS_SIZE_TIME="$RESOURCE_NOW"
+          fi
+
+          RESOURCE_VALUES="$(ps -p "$FFMPEG_PID" -o %cpu= -o rss= 2>/dev/null | \
+            awk -v cores="$LOGICAL_CPUS" 'NR == 1 {
+              total = $1 / cores
+              if (total > 100) total = 100
+              printf "%.0f %.1f %.1f", total, $1 / 100, $2 / 1024
+            }')"
+          if [[ -n "$RESOURCE_VALUES" ]]; then
+            RESOURCE_FIELDS=("${(@s: :)RESOURCE_VALUES}")
+            RESOURCE_CPU_TOTAL="${RESOURCE_FIELDS[1]}"
+            RESOURCE_CPU_CORES="${RESOURCE_FIELDS[2]}"
+            RESOURCE_RAM="${RESOURCE_FIELDS[3]}"
+          fi
+          RESOURCE_TEXT="CPU ${RESOURCE_CPU_TOTAL}% (${RESOURCE_CPU_CORES}/${LOGICAL_CPUS}) | RAM ${RESOURCE_RAM} МБ / ${TOTAL_RAM_TEXT} | ${RESOURCE_ENCODER}"
+          if [[ "$OUTPUT_WRITE_RATE" != "--" ]]; then
+            RESOURCE_TEXT+=" | запись ${OUTPUT_WRITE_RATE} МБ/с"
+          fi
+
+          if [[ "$PLAIN_PROGRESS" == "1" ]]; then
+            printf "Ресурсы: %s\n" "$RESOURCE_TEXT"
+          elif [[ "$RESOURCE_DISPLAY_STARTED" == "0" ]]; then
+            printf "\r\033[2KРесурсы: %s\n" "$RESOURCE_TEXT"
+            RESOURCE_DISPLAY_STARTED=1
+          else
+            printf "\r\033[1A\033[2K\rРесурсы: %s\n" "$RESOURCE_TEXT"
+          fi
+
+          print_progress "$STARTED" "$SOURCE_DURATION" "$POSITION" "Видео" \
+            "$CURRENT_SPEED" "$CURRENT_SIZE_TEXT" "$PREDICTED_SIZE_TEXT"
+          ;;
+      esac
+  done < "$PROGRESS_PIPE"
+
+  wait "$FFMPEG_PID"
+  FFMPEG_STATUS="$?"
+  FFMPEG_PID=""
+  rm -f "$PROGRESS_PIPE"
+  set -e
+  echo
+
+  if [[ "$FFMPEG_STATUS" != "0" ]]; then
+    echo "Ошибка ffmpeg:" >&2
+    sed -n '1,160p' "$ERROR_LOG" >&2
+    exit "$FFMPEG_STATUS"
+  fi
+
+  mv -f "$TEMP_OUTPUT" "$OUTPUT"
+  echo "Готово: $OUTPUT"
+  FINAL_BYTES="$(stat -f "%z" "$OUTPUT" 2>/dev/null || true)"
+  FINAL_BITRATE_RAW="$(
+    ffprobe -v error \
+      -show_entries format=bit_rate \
+      -of default=noprint_wrappers=1:nokey=1 \
+      "$OUTPUT" 2>/dev/null || true
+  )"
+  [[ -n "$FINAL_BYTES" ]] && echo "Итоговый размер: $(format_file_size "$FINAL_BYTES")"
+  if [[ -n "$FINAL_BITRATE_RAW" && "$FINAL_BITRATE_RAW" != "N/A" ]]; then
+    FINAL_BITRATE_MBPS="$(awk -v bitrate="$FINAL_BITRATE_RAW" \
+      'BEGIN { printf "%.3f", bitrate / 1000000 }')"
+    echo "Средний битрейт: ${FINAL_BITRATE_MBPS} Мбит/с"
+  fi
+  exit 0
+fi
+
+if [[ -z "$START_RAW" ]]; then
+  read "START_RAW?Старт (например 1:30): "
+fi
+if [[ -z "$END_RAW" ]]; then
+  read "END_RAW?Конец (например 1:50): "
+fi
+
+START_SECONDS="$(parse_time "$START_RAW")" || die "неверное время старта: $START_RAW"
+END_SECONDS="$(parse_time "$END_RAW")" || die "неверное время конца: $END_RAW"
+
+awk -v start="$START_SECONDS" -v end="$END_SECONDS" \
+  'BEGIN { exit !(end > start) }' || die "конец должен быть позже старта"
+
+awk -v start="$START_SECONDS" -v duration="$SOURCE_DURATION" \
+  'BEGIN { exit !(start < duration) }' || die "старт находится за пределами файла"
+awk -v end="$END_SECONDS" -v duration="$SOURCE_DURATION" \
+  'BEGIN { exit !(end <= duration + 0.001) }' || \
+  die "конец находится за пределами файла ($(format_time "$SOURCE_DURATION"))"
+
+CLIP_DURATION="$(awk -v start="$START_SECONDS" -v end="$END_SECONDS" \
+  'BEGIN { printf "%.6f", end - start }')"
+
+if [[ -n "$OUTPUT_RAW" ]]; then
+  if [[ "$OUTPUT_RAW" == */* ]]; then
+    OUTPUT="${OUTPUT_RAW:A}"
+  else
+    OUTPUT="$INPUT_DIR/$OUTPUT_RAW"
+  fi
+else
+  START_LABEL="$(safe_time_label "$START_SECONDS")"
+  END_LABEL="$(safe_time_label "$END_SECONDS")"
+  OUTPUT="$INPUT_DIR/$STEM.cut_${START_LABEL}_to_${END_LABEL}.$EXTENSION"
+fi
+OUTPUT="$(unique_output_path "$OUTPUT")"
+
+OUTPUT_DIR="${OUTPUT:h}"
+[[ -d "$OUTPUT_DIR" ]] || die "папка результата не существует: $OUTPUT_DIR"
+
+OUTPUT_NAME="${OUTPUT:t}"
+if [[ "$OUTPUT_NAME" == *.* ]]; then
+  OUTPUT_EXTENSION="${OUTPUT_NAME##*.}"
+  TEMP_OUTPUT="${OUTPUT%.*}.tmp.$$.$OUTPUT_EXTENSION"
+else
+  TEMP_OUTPUT="$OUTPUT.tmp.$$.mkv"
+fi
+ERROR_LOG="$(mktemp -t video-editor.XXXXXX)"
+TMP_FILES+=("$TEMP_OUTPUT" "$ERROR_LOG")
+
+CUT_VIDEO_CODEC="$(stream_value "$INPUT" "v:0" "codec_name")"
+CUT_AUDIO_CODEC="$(stream_value "$INPUT" "a:0" "codec_name")"
+CUT_WIDTH="$(stream_value "$INPUT" "v:0" "width")"
+CUT_HEIGHT="$(stream_value "$INPUT" "v:0" "height")"
+CUT_FPS_RAW="$(stream_value "$INPUT" "v:0" "avg_frame_rate")"
+CUT_FPS="$(awk -v rate="$CUT_FPS_RAW" 'BEGIN {
+  split(rate, part, "/")
+  value = part[2] > 0 ? part[1] / part[2] : part[1]
+  if (value > 0) printf "%.3f", value
+}')"
+
+echo "Источник:      $INPUT"
+if [[ -n "$CUT_VIDEO_CODEC" ]]; then
+  echo "Исходник:      ${CUT_WIDTH}x${CUT_HEIGHT}, ${CUT_FPS} fps, $CUT_VIDEO_CODEC"
+else
+  echo "Исходник:      аудио, ${CUT_AUDIO_CODEC:-неизвестный кодек}"
+fi
+echo "Старт:         $(format_time "$START_SECONDS")"
+echo "Конец:         $(format_time "$END_SECONDS")"
+echo "Длительность:  $(format_time "$CLIP_DURATION")"
+echo "Профиль:       Без повторного кодирования"
+if [[ -n "$CUT_VIDEO_CODEC" ]]; then
+  echo "Разрешение:    ${CUT_WIDTH}x${CUT_HEIGHT}, без изменений"
+  echo "Видео:         ${CUT_VIDEO_CODEC:u}, копирование"
+else
+  echo "Видео:         нет видеодорожки"
+fi
+if [[ -n "$CUT_AUDIO_CODEC" ]]; then
+  echo "Аудио:         ${CUT_AUDIO_CODEC:u}, копирование"
+else
+  echo "Аудио:         нет аудиодорожки"
+fi
+echo "Ускорение:     не требуется, потоки копируются"
+echo "Результат:     $OUTPUT"
+echo "Режим:         вырезание без повторного кодирования"
+
+SOURCE_BYTES="$(stat -f "%z" "$INPUT" 2>/dev/null || true)"
+if [[ "$SOURCE_BYTES" =~ '^[0-9]+$' && "$SOURCE_BYTES" -gt 0 ]]; then
+  ESTIMATED_BYTES="$(awk -v bytes="$SOURCE_BYTES" -v clip="$CLIP_DURATION" \
+    -v source="$SOURCE_DURATION" 'BEGIN { printf "%.0f", bytes * clip / source }')"
+else
+  ESTIMATED_BYTES="1000000"
+fi
+ESTIMATED_LOW_BYTES="$(awk -v bytes="$ESTIMATED_BYTES" 'BEGIN { printf "%.0f", bytes * 0.95 }')"
+ESTIMATED_HIGH_BYTES="$(awk -v bytes="$ESTIMATED_BYTES" 'BEGIN { printf "%.0f", bytes * 1.05 }')"
+echo "Прогноз размера: ~$(format_file_size "$ESTIMATED_BYTES") (диапазон $(format_file_size "$ESTIMATED_LOW_BYTES")–$(format_file_size "$ESTIMATED_HIGH_BYTES"))"
+
+STARTED="$(date +%s)"
+POSITION="0"
+CURRENT_SPEED="--"
+CURRENT_TOTAL_SIZE="0"
+DYNAMIC_ESTIMATE_BYTES="$ESTIMATED_BYTES"
+RESOURCE_CPU_TOTAL="--"
+RESOURCE_CPU_CORES="--"
+RESOURCE_RAM="--"
+RESOURCE_DISPLAY_STARTED=0
+OUTPUT_WRITE_RATE="--"
+PREVIOUS_TOTAL_SIZE="0"
+PREVIOUS_SIZE_TIME="$STARTED"
+PROGRESS_PIPE="$(mktemp -u -t video-editor-cut-progress.XXXXXX)"
+mkfifo "$PROGRESS_PIPE"
+TMP_FILES+=("$PROGRESS_PIPE")
+
+set +e
+ffmpeg \
+  -hide_banner \
+  -y \
+  -nostdin \
+  -nostats \
+  -stats_period 1 \
+  -progress "$PROGRESS_PIPE" \
+  -ss "$START_SECONDS" \
+  -i "$INPUT" \
+  -t "$CLIP_DURATION" \
+  -map 0 \
+  -map_metadata 0 \
+  -c copy \
+  -avoid_negative_ts make_zero \
+  "$TEMP_OUTPUT" >/dev/null 2>"$ERROR_LOG" &
+FFMPEG_PID="$!"
+
+while IFS='=' read -r key value; do
+    case "$key" in
+      out_time_us)
+        if [[ "$value" =~ '^[0-9]+$' ]]; then
+          POSITION="$(awk -v value="$value" 'BEGIN { printf "%.6f", value / 1000000 }')"
+        fi
+        ;;
+      speed)
+        CURRENT_SPEED="$value"
+        ;;
+      total_size)
+        if [[ "$value" =~ '^[0-9]+$' ]]; then
+          CURRENT_TOTAL_SIZE="$value"
+        fi
+        ;;
+      progress)
+        [[ "$value" == "end" ]] && POSITION="$CLIP_DURATION"
+        CURRENT_SIZE_TEXT=""
+        PREDICTED_SIZE_TEXT=""
+        if [[ "$CURRENT_TOTAL_SIZE" =~ '^[0-9]+$' && "$CURRENT_TOTAL_SIZE" != "0" ]]; then
+          CURRENT_SIZE_TEXT="$(format_file_size "$CURRENT_TOTAL_SIZE")"
+          if [[ "$value" == "end" ]]; then
+            DYNAMIC_ESTIMATE_BYTES="$CURRENT_TOTAL_SIZE"
+          elif awk -v position="$POSITION" -v target="$CLIP_DURATION" \
+            'BEGIN { exit !(position > 0 && target > 0) }'; then
+            DYNAMIC_ESTIMATE_BYTES="$(smooth_size_estimate "$ESTIMATED_BYTES" \
+              "$DYNAMIC_ESTIMATE_BYTES" "$CURRENT_TOTAL_SIZE" "$POSITION" "$CLIP_DURATION")"
+          fi
+          PREDICTED_SIZE_TEXT="$(format_file_size "$DYNAMIC_ESTIMATE_BYTES")"
+        fi
+
+        RESOURCE_NOW="$(date +%s)"
+        if [[ "$CURRENT_TOTAL_SIZE" =~ '^[0-9]+$' ]] && \
+          (( RESOURCE_NOW > PREVIOUS_SIZE_TIME )) && \
+          (( CURRENT_TOTAL_SIZE >= PREVIOUS_TOTAL_SIZE )); then
+          OUTPUT_WRITE_RATE="$(awk -v current="$CURRENT_TOTAL_SIZE" -v previous="$PREVIOUS_TOTAL_SIZE" \
+            -v now="$RESOURCE_NOW" -v before="$PREVIOUS_SIZE_TIME" \
+            'BEGIN { printf "%.1f", (current - previous) / (now - before) / 1000000 }')"
+          PREVIOUS_TOTAL_SIZE="$CURRENT_TOTAL_SIZE"
+          PREVIOUS_SIZE_TIME="$RESOURCE_NOW"
+        fi
+
+        RESOURCE_VALUES="$(ps -p "$FFMPEG_PID" -o %cpu= -o rss= 2>/dev/null | \
+          awk -v cores="$LOGICAL_CPUS" 'NR == 1 {
+            total = $1 / cores
+            if (total > 100) total = 100
+            printf "%.0f %.1f %.1f", total, $1 / 100, $2 / 1024
+        }')"
+        if [[ -n "$RESOURCE_VALUES" ]]; then
+          RESOURCE_FIELDS=("${(@s: :)RESOURCE_VALUES}")
+          RESOURCE_CPU_TOTAL="${RESOURCE_FIELDS[1]}"
+          RESOURCE_CPU_CORES="${RESOURCE_FIELDS[2]}"
+          RESOURCE_RAM="${RESOURCE_FIELDS[3]}"
+        fi
+        RESOURCE_TEXT="CPU ${RESOURCE_CPU_TOTAL}% (${RESOURCE_CPU_CORES}/${LOGICAL_CPUS}) | RAM ${RESOURCE_RAM} МБ / ${TOTAL_RAM_TEXT} | копирование потоков"
+        if [[ "$OUTPUT_WRITE_RATE" != "--" ]]; then
+          RESOURCE_TEXT+=" | запись ${OUTPUT_WRITE_RATE} МБ/с"
+        fi
+        if [[ "$PLAIN_PROGRESS" == "1" ]]; then
+          printf "Ресурсы: %s\n" "$RESOURCE_TEXT"
+        elif [[ "$RESOURCE_DISPLAY_STARTED" == "0" ]]; then
+          printf "\r\033[2KРесурсы: %s\n" "$RESOURCE_TEXT"
+          RESOURCE_DISPLAY_STARTED=1
+        else
+          printf "\r\033[1A\033[2K\rРесурсы: %s\n" "$RESOURCE_TEXT"
+        fi
+        print_progress "$STARTED" "$CLIP_DURATION" "$POSITION" "Фрагмент" \
+          "$CURRENT_SPEED" "$CURRENT_SIZE_TEXT" "$PREDICTED_SIZE_TEXT"
+        ;;
+    esac
+done < "$PROGRESS_PIPE"
+
+wait "$FFMPEG_PID"
+FFMPEG_STATUS="$?"
+FFMPEG_PID=""
+rm -f "$PROGRESS_PIPE"
+set -e
+echo
+
+if [[ "$FFMPEG_STATUS" != "0" ]]; then
+  echo "Ошибка ffmpeg:" >&2
+  sed -n '1,120p' "$ERROR_LOG" >&2
+  exit "$FFMPEG_STATUS"
+fi
+
+mv -f "$TEMP_OUTPUT" "$OUTPUT"
+echo "Готово: $OUTPUT"
+FINAL_BYTES="$(stat -f "%z" "$OUTPUT" 2>/dev/null || true)"
+[[ -n "$FINAL_BYTES" ]] && echo "Итоговый размер: $(format_file_size "$FINAL_BYTES")"

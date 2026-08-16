@@ -1,0 +1,31 @@
+.DS_Store
+
+# Local media and documents used during development
+/*.avi
+/*.AVI
+/*.mp4
+/*.MP4
+/*.mov
+/*.mkv
+/*.m4a
+/*.mp3
+/*.wav
+/*.flac
+/*.jpg
+/*.jpeg
+/*.png
+/*.rtf
+
+# Generated application bundle (the distributable ZIP is kept in dist/)
+/Video Editor.app/
+
+# Local standalone CLI helpers (not part of the macOS application source)
+/video_editor
+/compress_video_for_mac.sh
+/convert_avi_for_mac.sh
+/extract_audio_from_video.sh
+/extract_end_segments.sh
+
+# Temporary FFmpeg output
+*.tmp.*
+*.log
