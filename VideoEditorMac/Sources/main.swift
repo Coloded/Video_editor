@@ -50,6 +50,26 @@ private enum CompressionChoice {
     case cancelled
 }
 
+private enum AppLanguage: String {
+    case ru
+    case en
+
+    static let defaultsKey = "AppLanguage"
+
+    static func initial() -> AppLanguage {
+        if let override = ProcessInfo.processInfo.environment["VIDEO_EDITOR_LANGUAGE"],
+           let language = AppLanguage(rawValue: override.lowercased()) {
+            return language
+        }
+        if let saved = UserDefaults.standard.string(forKey: defaultsKey),
+           let language = AppLanguage(rawValue: saved) {
+            return language
+        }
+        let preferred = Locale.preferredLanguages.first?.lowercased() ?? "en"
+        return preferred.hasPrefix("ru") ? .ru : .en
+    }
+}
+
 private final class WindowBackgroundView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSColor.windowBackgroundColor.setFill()
@@ -240,6 +260,7 @@ private final class RangeTimelineView: NSControl {
 @available(macOS 13.0, *)
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate,
                          NSTableViewDataSource, NSTableViewDelegate {
+    private var appLanguage = AppLanguage.initial()
     private let profiles = [
         CompressionProfile(id: "240", title: "240p  -  H.264, 0.6 Мбит/с", suffix: "240p", targetShortSide: 240, standardBitrate: 0.6, highFPSBitrate: 0.9, videoCodec: "h264"),
         CompressionProfile(id: "360", title: "360p  -  H.264, 1 Мбит/с", suffix: "360p", targetShortSide: 360, standardBitrate: 1, highFPSBitrate: 1.5, videoCodec: "h264"),
@@ -259,7 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private var window: NSWindow!
     private let modeControl = NSSegmentedControl(
-        labels: ["Сжатие", "Вырезать", "Склейка"],
+        labels: ["", "", ""],
         trackingMode: .selectOne,
         target: nil,
         action: nil
@@ -267,7 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let fileField = NSTextField()
     private let browseButton = NSButton()
     private let profilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let cpuCheckbox = NSButton(checkboxWithTitle: "Только CPU", target: nil, action: nil)
+    private let cpuCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let startField = NSTextField()
     private let endField = NSTextField()
     private let playerView = AVPlayerView()
@@ -284,7 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var previewStack: NSStackView!
     private var playerTimeObserver: Any?
 
-    private let statusLabel = NSTextField(labelWithString: "Выберите файл")
+    private let statusLabel = NSTextField(labelWithString: "")
     private let percentLabel = NSTextField(labelWithString: "0%")
     private let progressBar = NSProgressIndicator()
     private let detailLabel = NSTextField(labelWithString: "")
@@ -310,6 +331,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private var mode: EditorMode {
         EditorMode(rawValue: modeControl.selectedSegment) ?? .compress
+    }
+
+    private func text(_ russian: String, _ english: String) -> String {
+        appLanguage == .ru ? russian : english
+    }
+
+    private func profileTitle(_ profile: CompressionProfile) -> String {
+        guard appLanguage == .en else { return profile.title }
+        return profile.title
+            .replacingOccurrences(of: "Мбит/с", with: "Mbps")
+            .replacingOccurrences(of: "компактный", with: "Compact")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -359,24 +391,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let applicationItem = NSMenuItem()
         let applicationMenu = NSMenu(title: "Video Editor")
         applicationMenu.addItem(
-            withTitle: "О Video Editor",
+            withTitle: text("О Video Editor", "About Video Editor"),
             action: #selector(showAbout(_:)),
             keyEquivalent: ""
         )
         applicationItem.submenu = applicationMenu
         mainMenu.addItem(applicationItem)
 
-        let fileItem = NSMenuItem(title: "Файл", action: nil, keyEquivalent: "")
-        let fileMenu = NSMenu(title: "Файл")
+        let fileItem = NSMenuItem(title: text("Файл", "File"), action: nil, keyEquivalent: "")
+        let fileMenu = NSMenu(title: text("Файл", "File"))
         let openItem = fileMenu.addItem(
-            withTitle: "Открыть файл…",
+            withTitle: text("Открыть файл…", "Open File…"),
             action: #selector(openFile(_:)),
             keyEquivalent: "o"
         )
         openItem.target = self
         fileMenu.addItem(.separator())
         let quitItem = fileMenu.addItem(
-            withTitle: "Выход",
+            withTitle: text("Выход", "Quit"),
             action: #selector(quitApplication(_:)),
             keyEquivalent: "q"
         )
@@ -384,7 +416,128 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
+        let languageItem = NSMenuItem(title: text("Язык", "Language"), action: nil, keyEquivalent: "")
+        let languageMenu = NSMenu(title: text("Язык", "Language"))
+        for (title, language) in [("Русский", AppLanguage.ru), ("English", AppLanguage.en)] {
+            let item = languageMenu.addItem(
+                withTitle: title,
+                action: #selector(selectLanguage(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = language.rawValue
+            item.state = language == appLanguage ? .on : .off
+        }
+        languageItem.submenu = languageMenu
+        mainMenu.addItem(languageItem)
+
         NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func selectLanguage(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let language = AppLanguage(rawValue: rawValue),
+              language != appLanguage else { return }
+        appLanguage = language
+        UserDefaults.standard.set(language.rawValue, forKey: AppLanguage.defaultsKey)
+        applyLanguage()
+    }
+
+    private var localizationPairs: [(String, String)] {
+        [
+            ("Файл", "File"), ("Профиль", "Profile"), ("Кодировщик", "Encoder"),
+            ("Время", "Time"), ("Старт", "Start"), ("Конец", "End"),
+            ("Только CPU", "CPU only"), ("Обзор…", "Browse…"), ("Добавить…", "Add…"),
+            ("Порядок сверху вниз", "Order top to bottom"), ("Показать", "Show"),
+            ("Выберите файл", "Select a file"), ("Файл не выбран", "No file selected"),
+            ("Ролики не выбраны", "No clips selected"),
+            ("Добавьте минимум два ролика", "Add at least two clips"),
+            ("Добавьте ещё один ролик", "Add one more clip"),
+            ("Анализирую ролики", "Analyzing clips"), ("Анализ качества", "Analyzing quality"),
+            ("Загрузка видео", "Loading video"), ("Анализирую файл…", "Analyzing file…"),
+            ("Видео не найдено", "No video found"), ("Нет видеодорожки", "No video track"),
+            ("Нет подходящих профилей", "No suitable profiles"),
+            ("Нет подходящего профиля", "No suitable profile"),
+            ("Готов к запуску", "Ready"), ("Готов к вырезанию", "Ready to cut"),
+            ("Готов к склейке", "Ready to join"), ("Сжимаю видео", "Compressing video"),
+            ("Вырезаю фрагмент", "Cutting clip"), ("Вырезаю и сжимаю", "Cutting and compressing"),
+            ("Склеиваю ролики", "Joining clips"), ("Склеиваю и сжимаю", "Joining and compressing"),
+            ("Готовлю сжатие", "Preparing compression"), ("Готовлю вырезание", "Preparing cut"),
+            ("Готовлю вырезание и сжатие", "Preparing cut and compression"),
+            ("Готовлю склейку", "Preparing join"), ("Анализирую размер", "Estimating size"),
+            ("Ошибка", "Error"), ("Готово", "Done"), ("Остановлено", "Stopped"),
+            ("Останавливаю", "Stopping"), ("Остановить", "Stop"),
+            ("Добавить ролики", "Add clips"), ("Удалить выбранный ролик", "Remove selected clip"),
+            ("Переместить ролик выше", "Move clip up"), ("Переместить ролик ниже", "Move clip down")
+        ]
+    }
+
+    private func localizedCurrentText(_ value: String) -> String {
+        for (russian, english) in localizationPairs where value == russian || value == english {
+            return text(russian, english)
+        }
+        let countedPrefixes = [
+            ("Выбрано роликов: ", "Selected clips: "),
+            ("Добавляется: ", "Adding: ")
+        ]
+        for (russian, english) in countedPrefixes {
+            if value.hasPrefix(russian) {
+                return text(russian, english) + value.dropFirst(russian.count)
+            }
+            if value.hasPrefix(english) {
+                return text(russian, english) + value.dropFirst(english.count)
+            }
+        }
+        return value
+    }
+
+    private func applyLanguage() {
+        configureMenu()
+        modeControl.setLabel(text("Сжатие", "Compress"), forSegment: EditorMode.compress.rawValue)
+        modeControl.setLabel(text("Вырезать", "Cut"), forSegment: EditorMode.cut.rawValue)
+        modeControl.setLabel(text("Склейка", "Join"), forSegment: EditorMode.join.rawValue)
+
+        if let contentView = window?.contentView {
+            for view in descendants(of: contentView) {
+                if let field = view as? NSTextField {
+                    field.stringValue = localizedCurrentText(field.stringValue)
+                    if let placeholder = field.placeholderString {
+                        field.placeholderString = localizedCurrentText(placeholder)
+                    }
+                    field.toolTip = field.toolTip.map(localizedCurrentText)
+                } else if let button = view as? NSButton {
+                    button.title = localizedCurrentText(button.title)
+                    button.toolTip = button.toolTip.map(localizedCurrentText)
+                }
+            }
+        }
+
+        browseButton.title = mode == .join ? text("Добавить…", "Add…") : text("Обзор…", "Browse…")
+        cpuCheckbox.title = text("Только CPU", "CPU only")
+        cpuCheckbox.toolTip = text("Отключить Apple VideoToolbox и кодировать процессором", "Disable Apple VideoToolbox and encode on the CPU")
+        timelineView.toolTip = text("Перетащите границы или весь выбранный фрагмент", "Drag either edge or the entire selected range")
+        revealButton.title = text("Показать", "Show")
+        revealButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: text("Показать в Finder", "Show in Finder"))
+        startButton.title = process?.isRunning == true ? text("Остановить", "Stop") : text("Старт", "Start")
+        startButton.image = NSImage(
+            systemSymbolName: process?.isRunning == true ? "stop.fill" : "play.fill",
+            accessibilityDescription: startButton.title
+        )
+
+        if profilePopup.numberOfItems == availableProfiles.count, !availableProfiles.isEmpty {
+            let selectedIndex = profilePopup.indexOfSelectedItem
+            profilePopup.removeAllItems()
+            profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
+            if availableProfiles.indices.contains(selectedIndex) {
+                profilePopup.selectItem(at: selectedIndex)
+            }
+        }
+        updateTechnicalDetails()
+        joinTable.reloadData()
+        if timelineView.isEnabled {
+            updateSelectionLabel()
+        }
+        window?.contentView?.needsLayout = true
     }
 
     private func configureWindow() {
@@ -410,6 +563,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         titleLabel.font = .systemFont(ofSize: 27, weight: .semibold)
 
         modeControl.selectedSegment = EditorMode.compress.rawValue
+        modeControl.setLabel(text("Сжатие", "Compress"), forSegment: EditorMode.compress.rawValue)
+        modeControl.setLabel(text("Вырезать", "Cut"), forSegment: EditorMode.cut.rawValue)
+        modeControl.setLabel(text("Склейка", "Join"), forSegment: EditorMode.join.rawValue)
         modeControl.target = self
         modeControl.action = #selector(modeChanged(_:))
         modeControl.controlSize = .large
@@ -423,12 +579,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         fileField.isEditable = false
         fileField.isSelectable = true
-        fileField.placeholderString = "Файл не выбран"
+        fileField.placeholderString = text("Файл не выбран", "No file selected")
         fileField.lineBreakMode = .byTruncatingMiddle
         fileField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        browseButton.title = "Обзор…"
-        browseButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Обзор")
+        browseButton.title = text("Обзор…", "Browse…")
+        browseButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: text("Обзор", "Browse"))
         browseButton.imagePosition = .imageLeading
         browseButton.bezelStyle = .rounded
         browseButton.controlSize = .large
@@ -439,19 +595,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         fileControls.orientation = .horizontal
         fileControls.alignment = .centerY
         fileControls.spacing = 10
-        let fileRow = makeLabeledRow(title: "Файл", control: fileControls)
+        let fileRow = makeLabeledRow(title: text("Файл", "File"), control: fileControls)
 
         availableProfiles = profiles
-        profilePopup.addItems(withTitles: availableProfiles.map(\.title))
+        profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
         profilePopup.selectItem(at: 4)
         profilePopup.target = self
         profilePopup.action = #selector(profileChanged(_:))
         profilePopup.controlSize = .large
         profilePopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        profileRow = makeLabeledRow(title: "Профиль", control: profilePopup)
+        profileRow = makeLabeledRow(title: text("Профиль", "Profile"), control: profilePopup)
 
-        cpuCheckbox.toolTip = "Отключить Apple VideoToolbox и кодировать процессором"
-        let cpuRow = makeLabeledRow(title: "Кодировщик", control: cpuCheckbox)
+        cpuCheckbox.title = text("Только CPU", "CPU only")
+        cpuCheckbox.toolTip = text("Отключить Apple VideoToolbox и кодировать процессором", "Disable Apple VideoToolbox and encode on the CPU")
+        let cpuRow = makeLabeledRow(title: text("Кодировщик", "Encoder"), control: cpuCheckbox)
         cpuRow.identifier = NSUserInterfaceItemIdentifier("cpuRow")
 
         startField.placeholderString = "1:30"
@@ -467,13 +624,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         startField.widthAnchor.constraint(greaterThanOrEqualToConstant: 130).isActive = true
         endField.widthAnchor.constraint(greaterThanOrEqualToConstant: 130).isActive = true
 
-        let startLabel = NSTextField(labelWithString: "Старт")
-        let endLabel = NSTextField(labelWithString: "Конец")
+        let startLabel = NSTextField(labelWithString: text("Старт", "Start"))
+        let endLabel = NSTextField(labelWithString: text("Конец", "End"))
         let timeControls = NSStackView(views: [startLabel, startField, endLabel, endField])
         timeControls.orientation = .horizontal
         timeControls.alignment = .centerY
         timeControls.spacing = 10
-        cutRow = makeLabeledRow(title: "Время", control: timeControls)
+        cutRow = makeLabeledRow(title: text("Время", "Time"), control: timeControls)
         cutRow.isHidden = true
 
         let clipColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("clip"))
@@ -497,26 +654,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         let addClipButton = makeIconButton(
             symbol: "plus",
-            toolTip: "Добавить ролики",
+            toolTip: text("Добавить ролики", "Add clips"),
             action: #selector(addJoinClips(_:))
         )
         let removeClipButton = makeIconButton(
             symbol: "minus",
-            toolTip: "Удалить выбранный ролик",
+            toolTip: text("Удалить выбранный ролик", "Remove selected clip"),
             action: #selector(removeJoinClip(_:))
         )
         let moveUpButton = makeIconButton(
             symbol: "chevron.up",
-            toolTip: "Переместить ролик выше",
+            toolTip: text("Переместить ролик выше", "Move clip up"),
             action: #selector(moveJoinClipUp(_:))
         )
         let moveDownButton = makeIconButton(
             symbol: "chevron.down",
-            toolTip: "Переместить ролик ниже",
+            toolTip: text("Переместить ролик ниже", "Move clip down"),
             action: #selector(moveJoinClipDown(_:))
         )
         joinEditButtons = [addClipButton, removeClipButton, moveUpButton, moveDownButton]
-        let joinHint = NSTextField(labelWithString: "Порядок сверху вниз")
+        let joinHint = NSTextField(labelWithString: text("Порядок сверху вниз", "Order top to bottom"))
         joinHint.textColor = .secondaryLabelColor
         let joinButtonSpacer = NSView()
         joinButtonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -541,7 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         playerHeightConstraint = playerView.heightAnchor.constraint(equalToConstant: 240)
         playerHeightConstraint.isActive = true
 
-        timelineView.toolTip = "Перетащите границы или весь выбранный фрагмент"
+        timelineView.toolTip = text("Перетащите границы или весь выбранный фрагмент", "Drag either edge or the entire selected range")
         timelineView.heightAnchor.constraint(equalToConstant: 72).isActive = true
         timelineView.onChange = { [weak self] lower, upper, previewTime in
             self?.timelineChanged(lower: lower, upper: upper, previewTime: previewTime)
@@ -590,16 +747,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         technicalLabel.maximumNumberOfLines = 3
         technicalLabel.isHidden = true
 
-        revealButton.title = "Показать"
-        revealButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Показать в Finder")
+        revealButton.title = text("Показать", "Show")
+        revealButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: text("Показать в Finder", "Show in Finder"))
         revealButton.imagePosition = .imageLeading
         revealButton.bezelStyle = .rounded
         revealButton.target = self
         revealButton.action = #selector(revealOutput(_:))
         revealButton.isHidden = true
 
-        startButton.title = "Старт"
-        startButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Старт")
+        startButton.title = text("Старт", "Start")
+        startButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: text("Старт", "Start"))
         startButton.imagePosition = .imageLeading
         startButton.bezelStyle = .rounded
         startButton.controlSize = .large
@@ -687,6 +844,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         window.makeKeyAndOrderFront(nil)
         modeControl.selectedSegment = EditorMode.compress.rawValue
+        statusLabel.stringValue = text("Выберите файл", "Select a file")
         modeControl.needsDisplay = true
         resizeWindow(for: .compress, animated: false)
     }
@@ -724,13 +882,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 switch self.mode {
                 case .compress:
                     self.processLine("Профиль: 1080p Full HD SDR", isError: false)
-                    self.statusLabel.stringValue = "Сжимаю видео"
+                    self.statusLabel.stringValue = self.text("Сжимаю видео", "Compressing video")
                 case .cut:
                     self.processLine("Профиль: Без повторного кодирования", isError: false)
-                    self.statusLabel.stringValue = "Вырезаю фрагмент"
+                    self.statusLabel.stringValue = self.text("Вырезаю фрагмент", "Cutting clip")
                 case .join:
                     self.processLine("Профиль: Без дополнительного сжатия", isError: false)
-                    self.statusLabel.stringValue = "Склеиваю ролики"
+                    self.statusLabel.stringValue = self.text("Склеиваю ролики", "Joining clips")
                 }
                 self.processLine("Исходник: 3840x2160, 23.976 fps, h264", isError: false)
                 self.processLine("Видео: H.264, VideoToolbox, 8.000 Мбит/с", isError: false)
@@ -767,14 +925,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func verifyRuntimeRequirements() -> Bool {
-        let requirements = "Минимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26."
+        let requirements = text(
+            "Минимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26.",
+            "Minimum version: macOS 13 Ventura.\nmacOS 13, 14, 15, and 26 are supported."
+        )
         guard ProcessInfo.processInfo.isOperatingSystemAtLeast(
             OperatingSystemVersion(majorVersion: 13, minorVersion: 0, patchVersion: 0)
         ) else {
             let alert = NSAlert()
-            alert.messageText = "Эта версия macOS не поддерживается"
+            alert.messageText = text("Эта версия macOS не поддерживается", "This macOS version is not supported")
             alert.informativeText = requirements
-            alert.addButton(withTitle: "Выйти")
+            alert.addButton(withTitle: text("Выйти", "Quit"))
             alert.runModal()
             NSApp.terminate(nil)
             return false
@@ -789,10 +950,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if let brew = brewPaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
             let command = "\(brew) install ffmpeg"
             let alert = NSAlert()
-            alert.messageText = "FFmpeg не установлен"
-            alert.informativeText = "Установите обычный FFmpeg командой:\n\n\(command)\n\nПосле установки перезапустите Video Editor.\n\n\(requirements)"
-            alert.addButton(withTitle: "Скопировать и открыть Terminal")
-            alert.addButton(withTitle: "Выйти")
+            alert.messageText = text("FFmpeg не установлен", "FFmpeg is not installed")
+            alert.informativeText = text(
+                "Установите обычный FFmpeg командой:\n\n\(command)\n\nПосле установки перезапустите Video Editor.\n\n\(requirements)",
+                "Install FFmpeg with:\n\n\(command)\n\nRestart Video Editor after installation.\n\n\(requirements)"
+            )
+            alert.addButton(withTitle: text("Скопировать и открыть Terminal", "Copy and open Terminal"))
+            alert.addButton(withTitle: text("Выйти", "Quit"))
             if alert.runModal() == .alertFirstButtonReturn {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(command, forType: .string)
@@ -800,10 +964,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         } else {
             let alert = NSAlert()
-            alert.messageText = "Homebrew и FFmpeg не установлены"
-            alert.informativeText = "Сначала установите Homebrew с brew.sh, затем выполните:\n\nbrew install ffmpeg\n\nПосле установки перезапустите Video Editor.\n\n\(requirements)"
-            alert.addButton(withTitle: "Открыть brew.sh")
-            alert.addButton(withTitle: "Выйти")
+            alert.messageText = text("Homebrew и FFmpeg не установлены", "Homebrew and FFmpeg are not installed")
+            alert.informativeText = text(
+                "Сначала установите Homebrew с brew.sh, затем выполните:\n\nbrew install ffmpeg\n\nПосле установки перезапустите Video Editor.\n\n\(requirements)",
+                "Install Homebrew from brew.sh, then run:\n\nbrew install ffmpeg\n\nRestart Video Editor after installation.\n\n\(requirements)"
+            )
+            alert.addButton(withTitle: text("Открыть brew.sh", "Open brew.sh"))
+            alert.addButton(withTitle: text("Выйти", "Quit"))
             if alert.runModal() == .alertFirstButtonReturn,
                let url = URL(string: "https://brew.sh") {
                 NSWorkspace.shared.open(url)
@@ -834,9 +1001,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc private func showAbout(_ sender: Any?) {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "Video Editor",
-            .applicationVersion: "3.3",
+            .applicationVersion: "3.4",
             .credits: NSAttributedString(
-                string: "Внутренний движок FFmpeg\n\nМинимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26."
+                string: text(
+                    "Внутренний движок FFmpeg\n\nМинимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26.",
+                    "Internal FFmpeg engine\n\nMinimum version: macOS 13 Ventura.\nmacOS 13, 14, 15, and 26 are supported."
+                )
             )
         ])
     }
@@ -844,10 +1014,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc private func quitApplication(_ sender: Any?) {
         if process?.isRunning == true {
             let alert = NSAlert()
-            alert.messageText = "Остановить текущую операцию?"
-            alert.informativeText = "Незавершённый файл будет удалён."
-            alert.addButton(withTitle: "Остановить и выйти")
-            alert.addButton(withTitle: "Продолжить работу")
+            alert.messageText = text("Остановить текущую операцию?", "Stop the current operation?")
+            alert.informativeText = text("Незавершённый файл будет удалён.", "The incomplete output file will be deleted.")
+            alert.addButton(withTitle: text("Остановить и выйти", "Stop and quit"))
+            alert.addButton(withTitle: text("Продолжить работу", "Keep working"))
             guard alert.runModal() == .alertFirstButtonReturn else { return }
             process?.interrupt()
         }
@@ -863,7 +1033,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinStack.isHidden = !joining
         cutRow.isHidden = !editing
         previewStack.isHidden = !editing
-        browseButton.title = joining ? "Добавить…" : "Обзор…"
+        browseButton.title = joining ? text("Добавить…", "Add…") : text("Обзор…", "Browse…")
         resourceLabel.isHidden = true
         sizeLabel.isHidden = true
         progressBar.doubleValue = 0
@@ -881,15 +1051,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 prepareJoinPreview(at: row)
             } else {
                 clearPreview()
-                fileField.stringValue = "Ролики не выбраны"
-                statusLabel.stringValue = "Добавьте минимум два ролика"
+                fileField.stringValue = text("Ролики не выбраны", "No clips selected")
+                statusLabel.stringValue = text("Добавьте минимум два ролика", "Add at least two clips")
                 startButton.isEnabled = false
             }
             return
         }
 
         guard let selectedInputURL else {
-            statusLabel.stringValue = "Выберите файл"
+            statusLabel.stringValue = text("Выберите файл", "Select a file")
             startButton.isEnabled = false
             return
         }
@@ -968,8 +1138,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
 
         let panel = NSOpenPanel()
-        panel.title = mode == .join ? "Выберите ролики" : "Выберите файл"
-        panel.prompt = mode == .join ? "Добавить" : "Открыть"
+        panel.title = mode == .join ? text("Выберите ролики", "Select clips") : text("Выберите файл", "Select a file")
+        panel.prompt = mode == .join ? text("Добавить", "Add") : text("Открыть", "Open")
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = mode == .join
@@ -990,8 +1160,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func addJoinURLs(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
-        statusLabel.stringValue = "Анализирую ролики"
-        detailLabel.stringValue = "Добавляется: \(urls.count)"
+        statusLabel.stringValue = text("Анализирую ролики", "Analyzing clips")
+        detailLabel.stringValue = text("Добавляется: \(urls.count)", "Adding: \(urls.count)")
         startButton.isEnabled = false
         let token = UUID()
         analysisToken = token
@@ -1016,8 +1186,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.joinTable.reloadData()
                 self.updateJoinFileSummary()
                 guard !clips.isEmpty else {
-                    self.statusLabel.stringValue = "Видео не найдено"
-                    self.detailLabel.stringValue = "Выбранные файлы не содержат видеодорожку"
+                    self.statusLabel.stringValue = self.text("Видео не найдено", "No video found")
+                    self.detailLabel.stringValue = self.text("Выбранные файлы не содержат видеодорожку", "The selected files do not contain a video track")
                     self.updateStartButtonAvailability()
                     return
                 }
@@ -1029,11 +1199,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func updateJoinFileSummary() {
         if joinClips.isEmpty {
-            fileField.stringValue = "Ролики не выбраны"
+            fileField.stringValue = text("Ролики не выбраны", "No clips selected")
             fileField.toolTip = nil
             selectedInputURL = nil
         } else {
-            fileField.stringValue = "Выбрано роликов: \(joinClips.count)"
+            fileField.stringValue = text("Выбрано роликов: \(joinClips.count)", "Selected clips: \(joinClips.count)")
             fileField.toolTip = joinClips.map { $0.url.lastPathComponent }.joined(separator: "\n")
             selectedInputURL = joinClips.first?.url
             window.representedURL = joinClips.first?.url
@@ -1082,7 +1252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         updateJoinFileSummary()
         guard !joinClips.isEmpty else {
             clearPreview()
-            statusLabel.stringValue = "Добавьте минимум два ролика"
+            statusLabel.stringValue = text("Добавьте минимум два ролика", "Add at least two clips")
             return
         }
         let nextRow = min(row, joinClips.count - 1)
@@ -1127,7 +1297,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         selectedInputURL = url
         fileField.stringValue = url.path
         fileField.toolTip = url.path
-        statusLabel.stringValue = mode == .compress ? "Анализ качества" : "Загрузка видео"
+        statusLabel.stringValue = mode == .compress
+            ? text("Анализ качества", "Analyzing quality")
+            : text("Загрузка видео", "Loading video")
         detailLabel.stringValue = ""
         resourceLabel.isHidden = true
         sizeLabel.isHidden = true
@@ -1150,12 +1322,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if availableProfiles.indices.contains(profilePopup.indexOfSelectedItem) {
             preferredProfileID = availableProfiles[profilePopup.indexOfSelectedItem].id
         }
-        statusLabel.stringValue = "Анализ качества"
+        statusLabel.stringValue = text("Анализ качества", "Analyzing quality")
         detailLabel.stringValue = ""
         startButton.isEnabled = false
         profilePopup.isEnabled = false
         profilePopup.removeAllItems()
-        profilePopup.addItem(withTitle: "Анализирую файл…")
+        profilePopup.addItem(withTitle: text("Анализирую файл…", "Analyzing file…"))
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -1170,11 +1342,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 } else {
                     self.availableProfiles = []
                     self.profilePopup.removeAllItems()
-                    self.profilePopup.addItem(withTitle: "Нет видеодорожки")
+                    self.profilePopup.addItem(withTitle: self.text("Нет видеодорожки", "No video track"))
                     self.profilePopup.isEnabled = false
                     self.startButton.isEnabled = false
-                    self.statusLabel.stringValue = "Видео не найдено"
-                    self.detailLabel.stringValue = "Для сжатия нужен файл с видеодорожкой"
+                    self.statusLabel.stringValue = self.text("Видео не найдено", "No video found")
+                    self.detailLabel.stringValue = self.text("Для сжатия нужен файл с видеодорожкой", "Compression requires a file with a video track")
                 }
             }
         }
@@ -1229,27 +1401,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         profilePopup.removeAllItems()
         guard !availableProfiles.isEmpty else {
-            profilePopup.addItem(withTitle: "Нет подходящих профилей")
+            profilePopup.addItem(withTitle: text("Нет подходящих профилей", "No suitable profiles"))
             profilePopup.isEnabled = false
             startButton.isEnabled = false
-            statusLabel.stringValue = "Нет подходящего профиля"
+            statusLabel.stringValue = text("Нет подходящего профиля", "No suitable profile")
             if info.isHDR || info.isHighBitDepth {
-                detailLabel.stringValue = "Обнаружено HDR или 10-битное видео"
+                detailLabel.stringValue = text("Обнаружено HDR или 10-битное видео", "HDR or 10-bit video detected")
             } else {
-                detailLabel.stringValue = "Разрешение или битрейт исходника ниже минимальных требований"
+                detailLabel.stringValue = text("Разрешение или битрейт исходника ниже минимальных требований", "The source resolution or bitrate is below the minimum requirements")
             }
             return
         }
 
-        profilePopup.addItems(withTitles: availableProfiles.map(\.title))
+        profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
         let selectedIndex = availableProfiles.firstIndex(where: { $0.id == preferredProfileID }) ?? (availableProfiles.count - 1)
         profilePopup.selectItem(at: selectedIndex)
         preferredProfileID = availableProfiles[selectedIndex].id
         profilePopup.isEnabled = process?.isRunning != true
         startButton.isEnabled = true
-        statusLabel.stringValue = "Готов к запуску"
+        statusLabel.stringValue = text("Готов к запуску", "Ready")
         detailLabel.stringValue = String(
-            format: "%dx%d   •   %.3f fps   •   %@   •   %.3f Мбит/с   •   профилей: %d",
+            format: text(
+                "%dx%d   •   %.3f fps   •   %@   •   %.3f Мбит/с   •   профилей: %d",
+                "%dx%d   •   %.3f fps   •   %@   •   %.3f Mbps   •   profiles: %d"
+            ),
             info.width, info.height, info.fps, info.codec, info.videoBitrate, availableProfiles.count
         )
     }
@@ -1312,7 +1487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         timelineView.thumbnails = []
         timelineView.isEnabled = false
         selectionLabel.stringValue = ""
-        statusLabel.stringValue = "Загрузка видео"
+        statusLabel.stringValue = text("Загрузка видео", "Loading video")
         detailLabel.stringValue = ""
         startButton.isEnabled = false
 
@@ -1324,7 +1499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard duration.isFinite, duration > 0 else {
                 DispatchQueue.main.async {
                     guard self.previewToken == token else { return }
-                    self.statusLabel.stringValue = "Не удалось открыть видео"
+                    self.statusLabel.stringValue = self.text("Не удалось открыть видео", "Could not open video")
                     self.startButton.isEnabled = false
                 }
                 return
@@ -1340,8 +1515,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.startField.stringValue = self.formatEditorTime(0)
                 self.endField.stringValue = self.formatEditorTime(duration)
                 self.updateSelectionLabel()
-                self.statusLabel.stringValue = "Готов к вырезанию"
-                self.detailLabel.stringValue = "Длительность \(self.formatEditorTime(duration))"
+                self.statusLabel.stringValue = self.text("Готов к вырезанию", "Ready to cut")
+                self.detailLabel.stringValue = self.text(
+                    "Длительность \(self.formatEditorTime(duration))",
+                    "Duration \(self.formatEditorTime(duration))"
+                )
                 self.startButton.isEnabled = true
                 player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
                 self.playerTimeObserver = player.addPeriodicTimeObserver(
@@ -1396,8 +1574,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         startField.stringValue = formatEditorTime(clip.lowerValue)
         endField.stringValue = formatEditorTime(clip.upperValue)
         updateSelectionLabel()
-        statusLabel.stringValue = joinClips.count >= 2 ? "Готов к склейке" : "Добавьте ещё один ролик"
-        detailLabel.stringValue = "Ролик \(index + 1) из \(joinClips.count)   •   \(clip.info.width)x\(clip.info.height)"
+        statusLabel.stringValue = joinClips.count >= 2
+            ? text("Готов к склейке", "Ready to join")
+            : text("Добавьте ещё один ролик", "Add one more clip")
+        detailLabel.stringValue = text(
+            "Ролик \(index + 1) из \(joinClips.count)   •   \(clip.info.width)x\(clip.info.height)",
+            "Clip \(index + 1) of \(joinClips.count)   •   \(clip.info.width)x\(clip.info.height)"
+        )
         updateStartButtonAvailability()
         player.seek(
             to: CMTime(seconds: clip.lowerValue, preferredTimescale: 600),
@@ -1494,9 +1677,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func updateSelectionLabel() {
         let length = max(0, timelineView.upperValue - timelineView.lowerValue)
         if mode == .join, joinClips.indices.contains(joinTable.selectedRow) {
-            selectionLabel.stringValue = "Ролик \(joinTable.selectedRow + 1)   •   фрагмент: \(formatEditorTime(length))"
+            selectionLabel.stringValue = text(
+                "Ролик \(joinTable.selectedRow + 1)   •   фрагмент: \(formatEditorTime(length))",
+                "Clip \(joinTable.selectedRow + 1)   •   selection: \(formatEditorTime(length))"
+            )
         } else {
-            selectionLabel.stringValue = "Фрагмент: \(formatEditorTime(length))"
+            selectionLabel.stringValue = text("Фрагмент: \(formatEditorTime(length))", "Selection: \(formatEditorTime(length))")
         }
     }
 
@@ -1521,7 +1707,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc private func startWork(_ sender: Any?) {
         guard let inputURL = mode == .join ? joinClips.first?.url : selectedInputURL else {
-            showError(title: "Файл не выбран", message: "Сначала выберите исходный файл.")
+            showError(
+                title: text("Файл не выбран", "No file selected"),
+                message: text("Сначала выберите исходный файл.", "Select a source file first.")
+            )
             return
         }
 
@@ -1531,14 +1720,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                   end > start,
                   end <= timelineView.duration else {
                 showError(
-                    title: "Проверьте время",
-                    message: "Укажите старт и конец, например 1:30 и 1:50. Конец должен быть позже старта."
+                    title: text("Проверьте время", "Check the time range"),
+                    message: text(
+                        "Укажите старт и конец, например 1:30 и 1:50. Конец должен быть позже старта.",
+                        "Enter a start and end time, for example 1:30 and 1:50. The end must be later than the start."
+                    )
                 )
                 return
             }
         } else if mode == .join {
             guard joinClips.count >= 2 else {
-                showError(title: "Недостаточно роликов", message: "Для склейки добавьте минимум два ролика.")
+                showError(
+                    title: text("Недостаточно роликов", "Not enough clips"),
+                    message: text("Для склейки добавьте минимум два ролика.", "Add at least two clips to join them.")
+                )
                 return
             }
         }
@@ -1546,27 +1741,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let savePanel = NSSavePanel()
         savePanel.directoryURL = inputURL.deletingLastPathComponent()
         savePanel.canCreateDirectories = true
-        savePanel.prompt = "Сохранить"
+        savePanel.prompt = text("Сохранить", "Save")
 
         let stem = inputURL.deletingPathExtension().lastPathComponent
         switch mode {
         case .compress:
             guard availableProfiles.indices.contains(profilePopup.indexOfSelectedItem) else {
-                showError(title: "Профиль недоступен", message: "Выберите другой видеофайл.")
+                showError(
+                    title: text("Профиль недоступен", "Profile unavailable"),
+                    message: text("Выберите другой видеофайл.", "Select a different video file.")
+                )
                 return
             }
             let profile = availableProfiles[profilePopup.indexOfSelectedItem]
-            savePanel.title = "Куда сохранить сжатое видео"
+            savePanel.title = text("Куда сохранить сжатое видео", "Save compressed video")
             savePanel.nameFieldStringValue = "\(stem).\(profile.suffix).mp4"
             savePanel.allowedContentTypes = [.mpeg4Movie]
         case .cut:
             let ext = inputURL.pathExtension.isEmpty ? "mkv" : inputURL.pathExtension
-            savePanel.title = "Куда сохранить фрагмент"
+            savePanel.title = text("Куда сохранить фрагмент", "Save clip")
             savePanel.nameFieldStringValue = "\(stem).cut.\(ext)"
             savePanel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .audiovisualContent]
             savePanel.allowsOtherFileTypes = true
         case .join:
-            savePanel.title = "Куда сохранить склеенное видео"
+            savePanel.title = text("Куда сохранить склеенное видео", "Save joined video")
             savePanel.nameFieldStringValue = "\(stem).joined.mp4"
             savePanel.allowedContentTypes = [.mpeg4Movie]
         }
@@ -1604,16 +1802,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func askCompressionChoice(from candidates: [CompressionProfile]) -> CompressionChoice {
         let alert = NSAlert()
-        alert.messageText = "Сжать результат?"
+        alert.messageText = text("Сжать результат?", "Compress the result?")
         alert.informativeText = candidates.isEmpty
-            ? "Для качества исходника нет подходящих профилей. Можно сохранить без дополнительного сжатия."
-            : "Выберите профиль или сохраните результат без дополнительного сжатия."
-        alert.addButton(withTitle: "Продолжить")
-        alert.addButton(withTitle: "Отмена")
+            ? text("Для качества исходника нет подходящих профилей. Можно сохранить без дополнительного сжатия.", "No compression profile is suitable for this source. You can save without additional compression.")
+            : text("Выберите профиль или сохраните результат без дополнительного сжатия.", "Choose a profile or save without additional compression.")
+        alert.addButton(withTitle: text("Продолжить", "Continue"))
+        alert.addButton(withTitle: text("Отмена", "Cancel"))
 
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 390, height: 30), pullsDown: false)
-        popup.addItem(withTitle: "Без дополнительного сжатия")
-        popup.addItems(withTitles: candidates.map(\.title))
+        popup.addItem(withTitle: text("Без дополнительного сжатия", "Without additional compression"))
+        popup.addItems(withTitles: candidates.map(profileTitle))
         popup.selectItem(at: 0)
         alert.accessoryView = popup
 
@@ -1626,8 +1824,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func beginProcess(inputURL: URL, outputURL: URL) {
         guard let executable = locateVideoEngine() else {
             showError(
-                title: "Внутренний движок не найден",
-                message: "Переустановите приложение: необходимый компонент отсутствует внутри Video Editor.app."
+                title: text("Внутренний движок не найден", "Internal engine not found"),
+                message: text(
+                    "Переустановите приложение: необходимый компонент отсутствует внутри Video Editor.app.",
+                    "Reinstall the application. A required component is missing from Video Editor.app."
+                )
             )
             return
         }
@@ -1657,7 +1858,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard joinClips.count >= 2 else { return }
             let invalidPath = joinClips.first { $0.url.path.contains("\t") || $0.url.path.contains("\n") }
             guard invalidPath == nil else {
-                showError(title: "Неподдерживаемое имя файла", message: "В имени ролика не должно быть табуляции или переноса строки.")
+                showError(
+                    title: text("Неподдерживаемое имя файла", "Unsupported file name"),
+                    message: text("В имени ролика не должно быть табуляции или переноса строки.", "A clip name must not contain tabs or line breaks.")
+                )
                 return
             }
             let manifest = joinClips.map {
@@ -1668,7 +1872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             do {
                 try manifest.data(using: .utf8)?.write(to: manifestURL, options: .atomic)
             } catch {
-                showError(title: "Не удалось подготовить склейку", message: error.localizedDescription)
+                showError(title: text("Не удалось подготовить склейку", "Could not prepare joining"), message: error.localizedDescription)
                 return
             }
             processManifestURL = manifestURL
@@ -1714,11 +1918,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         switch mode {
         case .compress:
-            statusLabel.stringValue = "Готовлю сжатие"
+            statusLabel.stringValue = text("Готовлю сжатие", "Preparing compression")
         case .cut:
-            statusLabel.stringValue = pendingCompressionProfile == nil ? "Готовлю вырезание" : "Готовлю вырезание и сжатие"
+            statusLabel.stringValue = pendingCompressionProfile == nil
+                ? text("Готовлю вырезание", "Preparing cut")
+                : text("Готовлю вырезание и сжатие", "Preparing cut and compression")
         case .join:
-            statusLabel.stringValue = "Готовлю склейку"
+            statusLabel.stringValue = text("Готовлю склейку", "Preparing join")
         }
         detailLabel.stringValue = ""
         resourceLabel.stringValue = ""
@@ -1764,7 +1970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             setRunning(false)
             process = nil
             removeProcessManifest()
-            showError(title: "Не удалось запустить", message: error.localizedDescription)
+            showError(title: text("Не удалось запустить", "Could not start"), message: error.localizedDescription)
         }
     }
 
@@ -1815,7 +2021,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard !line.isEmpty else { return }
 
         if line.hasPrefix("Ресурсы:") {
-            resourceLabel.stringValue = line.replacingOccurrences(of: "Ресурсы:", with: "").trimmingCharacters(in: .whitespaces)
+            resourceLabel.stringValue = localizedEngineText(
+                line.replacingOccurrences(of: "Ресурсы:", with: "").trimmingCharacters(in: .whitespaces)
+            )
             resourceLabel.isHidden = false
             return
         }
@@ -1833,45 +2041,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             percentLabel.stringValue = "\(Int(percent))%"
             switch mode {
             case .compress:
-                statusLabel.stringValue = "Сжимаю видео"
+                statusLabel.stringValue = text("Сжимаю видео", "Compressing video")
             case .cut:
-                statusLabel.stringValue = pendingCompressionProfile == nil ? "Вырезаю фрагмент" : "Вырезаю и сжимаю"
+                statusLabel.stringValue = pendingCompressionProfile == nil
+                    ? text("Вырезаю фрагмент", "Cutting clip")
+                    : text("Вырезаю и сжимаю", "Cutting and compressing")
             case .join:
-                statusLabel.stringValue = pendingCompressionProfile == nil ? "Склеиваю ролики" : "Склеиваю и сжимаю"
+                statusLabel.stringValue = pendingCompressionProfile == nil
+                    ? text("Склеиваю ролики", "Joining clips")
+                    : text("Склеиваю и сжимаю", "Joining and compressing")
             }
 
             var details: [String] = []
             if let elapsed = capture(#"прошло\s+([^|]+)"#, in: line) {
-                details.append("Прошло \(elapsed.trimmingCharacters(in: .whitespaces))")
+                details.append(text("Прошло ", "Elapsed ") + elapsed.trimmingCharacters(in: .whitespaces))
             }
             if let remaining = capture(#"осталось\s+([^|]+)"#, in: line) {
-                details.append("Осталось \(remaining.trimmingCharacters(in: .whitespaces))")
+                details.append(text("Осталось ", "Remaining ") + remaining.trimmingCharacters(in: .whitespaces))
             }
             if let speed = capture(#"\|\s*([0-9.eE+-]+x)(?:\s*\||$)"#, in: line) {
-                details.append("Скорость \(speed)")
+                details.append(text("Скорость ", "Speed ") + speed)
             }
             detailLabel.stringValue = details.joined(separator: "   •   ")
 
             if let sizes = capture(#"файл\s+(.+?)\s+->\s+итог\s+~(.+)$"#, in: line, group: 0) {
-                sizeLabel.stringValue = sizes
+                sizeLabel.stringValue = localizedEngineText(sizes)
                 sizeLabel.isHidden = false
             }
             return
         }
 
         if line.hasPrefix("Оценка размера:") {
-            statusLabel.stringValue = "Анализирую размер"
+            statusLabel.stringValue = text("Анализирую размер", "Estimating size")
         } else if line.hasPrefix("Прогноз размера:") {
-            sizeLabel.stringValue = line
+            sizeLabel.stringValue = localizedEngineText(line)
             sizeLabel.isHidden = false
         } else if line.hasPrefix("Пробный VBR:") {
-            detailLabel.stringValue = line
+            detailLabel.stringValue = localizedEngineText(line)
         } else if line.hasPrefix("Итоговый размер:") {
-            sizeLabel.stringValue = line
+            sizeLabel.stringValue = localizedEngineText(line)
             sizeLabel.isHidden = false
         } else if line.hasPrefix("Ошибка:") || isError {
-            if statusLabel.stringValue != "Останавливаю" {
-                statusLabel.stringValue = "Ошибка"
+            if statusLabel.stringValue != text("Останавливаю", "Stopping") {
+                statusLabel.stringValue = text("Ошибка", "Error")
             }
         }
     }
@@ -1884,12 +2096,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         ].compactMap { keys -> String? in
             let values = keys.compactMap { key -> String? in
                 guard let value = technicalValues[key], !value.isEmpty else { return nil }
-                return "\(key): \(value)"
+                let localizedKey: String
+                switch key {
+                case "Профиль": localizedKey = text("Профиль", "Profile")
+                case "Исходник": localizedKey = text("Исходник", "Source")
+                case "Разрешение": localizedKey = text("Разрешение", "Resolution")
+                case "Видео": localizedKey = text("Видео", "Video")
+                case "Аудио": localizedKey = text("Аудио", "Audio")
+                case "Ускорение": localizedKey = text("Ускорение", "Acceleration")
+                case "Режим": localizedKey = text("Режим", "Mode")
+                default: localizedKey = key
+                }
+                return "\(localizedKey): \(localizedEngineText(value))"
             }
             return values.isEmpty ? nil : values.joined(separator: "   •   ")
         }
         technicalLabel.stringValue = rows.joined(separator: "\n")
         technicalLabel.isHidden = rows.isEmpty
+    }
+
+    private func localizedEngineText(_ source: String) -> String {
+        guard appLanguage == .en else { return source }
+        let replacements = [
+            ("Прогноз размера:", "Estimated size:"), ("Пробный VBR:", "VBR test:"),
+            ("Итоговый размер:", "Final size:"), ("Оценка размера:", "Estimating size:"),
+            ("Мбит/с", "Mbps"), ("кбит/с", "kbps"), ("кГц", "kHz"),
+            ("МБ", "MB"), ("ГБ", "GB"), ("стерео", "stereo"),
+            ("аппаратный медиадвижок", "hardware media engine"),
+            ("процессор", "CPU"), ("запись", "write"),
+            ("Без повторного кодирования", "No re-encoding"),
+            ("Без дополнительного сжатия", "No additional compression"),
+            ("Сжатие", "Compression"), ("Вырезание", "Cutting"), ("Склейка", "Joining"),
+            ("файл", "file"), ("итог", "result")
+        ]
+        return replacements.reduce(source) { result, replacement in
+            result.replacingOccurrences(of: replacement.0, with: replacement.1)
+        }
     }
 
     private func capture(_ pattern: String, in text: String, group: Int = 1) -> String? {
@@ -1912,23 +2154,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         pendingCompressionProfile = nil
 
         if wasCancelled {
-            statusLabel.stringValue = "Остановлено"
-            detailLabel.stringValue = "Незавершённый файл удалён"
+            statusLabel.stringValue = text("Остановлено", "Stopped")
+            detailLabel.stringValue = text("Незавершённый файл удалён", "The incomplete output file was deleted")
             return
         }
 
         if exitCode == 0 {
             progressBar.doubleValue = 100
             percentLabel.stringValue = "100%"
-            statusLabel.stringValue = "Готово"
+            statusLabel.stringValue = text("Готово", "Done")
             detailLabel.stringValue = selectedOutputURL?.path ?? ""
             revealButton.isHidden = false
         } else {
-            statusLabel.stringValue = "Ошибка"
+            statusLabel.stringValue = text("Ошибка", "Error")
             let message = diagnosticOutput.trimmingCharacters(in: .whitespacesAndNewlines)
             showError(
-                title: "Операция не выполнена",
-                message: message.isEmpty ? "Внутренний движок завершился с кодом \(exitCode)." : String(message.suffix(5_000))
+                title: text("Операция не выполнена", "Operation failed"),
+                message: appLanguage == .en
+                    ? "The internal engine exited with code \(exitCode). Check the source file and selected settings."
+                    : (message.isEmpty ? "Внутренний движок завершился с кодом \(exitCode)." : String(message.suffix(5_000)))
             )
         }
     }
@@ -1951,14 +2195,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinEditButtons.forEach { $0.isEnabled = !running }
         timelineView.isEnabled = !running && (mode == .cut || mode == .join) && selectedInputURL != nil
         if running {
-            startButton.title = "Остановить"
-            startButton.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: "Остановить")
+            startButton.title = text("Остановить", "Stop")
+            startButton.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: text("Остановить", "Stop"))
             startButton.action = #selector(cancelWork(_:))
             startButton.keyEquivalent = ""
             startButton.isEnabled = true
         } else {
-            startButton.title = "Старт"
-            startButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Старт")
+            startButton.title = text("Старт", "Start")
+            startButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: text("Старт", "Start"))
             startButton.action = #selector(startWork(_:))
             startButton.keyEquivalent = "\r"
             updateStartButtonAvailability()
@@ -1988,7 +2232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc private func cancelWork(_ sender: Any?) {
         guard let process, process.isRunning else { return }
         wasCancelled = true
-        statusLabel.stringValue = "Останавливаю"
+        statusLabel.stringValue = text("Останавливаю", "Stopping")
         startButton.isEnabled = false
         process.interrupt()
 
@@ -2029,12 +2273,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
 private final class UnsupportedSystemDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let language = AppLanguage.initial()
+        func text(_ russian: String, _ english: String) -> String {
+            language == .ru ? russian : english
+        }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Эта версия macOS не поддерживается"
-        alert.informativeText = "Минимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26."
-        alert.addButton(withTitle: "Выйти")
+        alert.messageText = text("Эта версия macOS не поддерживается", "This macOS version is not supported")
+        alert.informativeText = text(
+            "Минимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26.",
+            "Minimum version: macOS 13 Ventura.\nmacOS 13, 14, 15, and 26 are supported."
+        )
+        alert.addButton(withTitle: text("Выйти", "Quit"))
         alert.runModal()
         NSApp.terminate(nil)
     }
