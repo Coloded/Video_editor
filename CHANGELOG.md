@@ -8,6 +8,18 @@
 
 Изменения для следующей версии пока не опубликованы.
 
+## [3.6.1] — 2026-08-19
+
+### Исправлено
+
+- Окно «О программе» теперь получает номер версии и сборки из `Info.plist` вместо устаревшего значения **3.4**, записанного в исходном коде.
+
+### Изменено
+
+- В окно «О программе» добавлены перечни поддерживаемых входных и выходных форматов файлов на русском и английском языках.
+- Версия приложения повышена до **3.6.1** (build 10).
+- Добавлена готовая сборка `Video-Editor-3.6.1-arm64.zip` для Apple Silicon.
+
 ## [3.6] — 2026-08-19
 
 ### Добавлено
@@ -121,7 +133,8 @@
 - Скриншоты обрезаны по границам приложения, чтобы убрать рабочий стол и посторонние окна.
 - Упрощено описание структуры проекта.
 
-[Unreleased]: https://github.com/Coloded/Video_editor/compare/v3.6...HEAD
+[Unreleased]: https://github.com/Coloded/Video_editor/compare/v3.6.1...HEAD
+[3.6.1]: https://github.com/Coloded/Video_editor/compare/v3.6...v3.6.1
 [3.6]: https://github.com/Coloded/Video_editor/compare/v3.5...v3.6
 [3.5]: https://github.com/Coloded/Video_editor/compare/v3.4...v3.5
 [3.4]: https://github.com/Coloded/Video_editor/compare/v3.3...v3.4

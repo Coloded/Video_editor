@@ -1041,13 +1041,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     @objc private func showAbout(_ sender: Any?) {
+        let applicationVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "—"
+        let buildVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String
+        let displayedVersion = buildVersion.map { "\(applicationVersion) (\($0))" } ?? applicationVersion
+
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "Video Editor",
-            .applicationVersion: "3.4",
+            .applicationVersion: displayedVersion,
             .credits: NSAttributedString(
                 string: text(
-                    "Внутренний движок FFmpeg\n\nМинимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26.",
-                    "Internal FFmpeg engine\n\nMinimum version: macOS 13 Ventura.\nmacOS 13, 14, 15, and 26 are supported."
+                    "Внутренний движок FFmpeg\n\nВходные форматы:\n.mov, .mp4, .m4v, .mkv, .avi, .webm, .mpg, .mpeg, .ts, .mts, .m2ts, .vob, .3gp, .flv, .wmv, .ogv\n\nВыходные форматы:\n.mp4, .mov, .mkv\n\nМинимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26.",
+                    "Internal FFmpeg engine\n\nInput formats:\n.mov, .mp4, .m4v, .mkv, .avi, .webm, .mpg, .mpeg, .ts, .mts, .m2ts, .vob, .3gp, .flv, .wmv, .ogv\n\nOutput formats:\n.mp4, .mov, .mkv\n\nMinimum version: macOS 13 Ventura.\nmacOS 13, 14, 15, and 26 are supported."
                 )
             )
         ])
