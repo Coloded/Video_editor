@@ -18,6 +18,7 @@ OVERWRITE=0
 COMPRESS_PROFILE=""
 CODEC_RAW=""
 BITRATE_RAW=""
+HDR_MODE="auto"
 USE_SOFTWARE=0
 PLAIN_PROGRESS=0
 TMP_FILES=()
@@ -72,6 +73,8 @@ video_editor — вырезание, сжатие и склейка аудио/�
                         youtube или youtube-compact
   -c, --codec CODEC     h264 или hevc; переопределяет кодек профиля
   -b, --bitrate MBPS    Видеобитрейт в Мбит/с, например 40 или 40M
+  --preserve-hdr        Сохранить HDR и 10 бит в HEVC Main 10
+  --convert-sdr         Преобразовать HDR в совместимый SDR 8 бит
   --no-gpu, --cpu       Не использовать VideoToolbox; кодировать процессором
   --software            То же, что --no-gpu (для совместимости)
   -s START -e END       Одновременно вырезать и сжать указанный фрагмент
@@ -796,6 +799,14 @@ while (( $# > 0 )); do
       BITRATE_RAW="$2"
       shift 2
       ;;
+    --preserve-hdr)
+      HDR_MODE="preserve"
+      shift
+      ;;
+    --convert-sdr)
+      HDR_MODE="sdr"
+      shift
+      ;;
     --software|--no-gpu|--cpu)
       USE_SOFTWARE=1
       shift
@@ -919,9 +930,23 @@ if [[ "$COMMAND" == "compress" ]]; then
   SOURCE_WIDTH="$(stream_value "$INPUT" "v:0" "width")"
   SOURCE_HEIGHT="$(stream_value "$INPUT" "v:0" "height")"
   SOURCE_PIX_FMT="$(stream_value "$INPUT" "v:0" "pix_fmt")"
+  SOURCE_COLOR_SPACE="$(stream_value "$INPUT" "v:0" "color_space")"
   SOURCE_COLOR_TRANSFER="$(stream_value "$INPUT" "v:0" "color_transfer")"
+  SOURCE_COLOR_PRIMARIES="$(stream_value "$INPUT" "v:0" "color_primaries")"
+  SOURCE_COLOR_RANGE="$(stream_value "$INPUT" "v:0" "color_range")"
   SOURCE_VIDEO_BITRATE="$(stream_value "$INPUT" "v:0" "bit_rate")"
   SOURCE_FPS_RAW="$(stream_value "$INPUT" "v:0" "avg_frame_rate")"
+  SOURCE_ROTATION="$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream_side_data=rotation \
+    -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -n 1)"
+  DISPLAY_WIDTH="$SOURCE_WIDTH"
+  DISPLAY_HEIGHT="$SOURCE_HEIGHT"
+  case "$SOURCE_ROTATION" in
+    90|-90|270|-270)
+      DISPLAY_WIDTH="$SOURCE_HEIGHT"
+      DISPLAY_HEIGHT="$SOURCE_WIDTH"
+      ;;
+  esac
   SOURCE_FPS="$(awk -v rate="$SOURCE_FPS_RAW" 'BEGIN {
     split(rate, part, "/")
     value = part[2] > 0 ? part[1] / part[2] : part[1]
@@ -1058,7 +1083,24 @@ if [[ "$COMMAND" == "compress" ]]; then
   HEVC_PROFILE_BITRATE="$(awk -v bitrate="$H264_PROFILE_BITRATE" \
     'BEGIN { printf "%.3f", bitrate * 0.60 }')"
 
-  VIDEO_CODEC="${CODEC_RAW:-$PRESET_CODEC}"
+  SOURCE_HDR=0
+  case "$SOURCE_COLOR_TRANSFER" in
+    smpte2084|arib-std-b67) SOURCE_HDR=1 ;;
+  esac
+  SOURCE_HIGH_BIT_DEPTH=0
+  if [[ "$SOURCE_PIX_FMT" == *10* || "$SOURCE_PIX_FMT" == *12* ]]; then
+    SOURCE_HIGH_BIT_DEPTH=1
+  fi
+  if [[ "$HDR_MODE" == "auto" && ( "$SOURCE_HDR" == "1" || "$SOURCE_HIGH_BIT_DEPTH" == "1" ) ]]; then
+    HDR_MODE="preserve"
+  fi
+
+  if [[ "$HDR_MODE" == "preserve" && ( "$SOURCE_HDR" == "1" || "$SOURCE_HIGH_BIT_DEPTH" == "1" ) ]]; then
+    [[ "$CODEC_RAW" != "h264" ]] || die "для сохранения HDR требуется HEVC; снимите HDR или не указывайте H.264"
+    VIDEO_CODEC="hevc"
+  else
+    VIDEO_CODEC="${CODEC_RAW:-$PRESET_CODEC}"
+  fi
   case "$VIDEO_CODEC" in
     h264|hevc) ;;
     *) die "кодек должен быть h264 или hevc" ;;
@@ -1073,17 +1115,17 @@ if [[ "$COMMAND" == "compress" ]]; then
     VIDEO_BITRATE="$(normalize_bitrate "$HEVC_PROFILE_BITRATE")"
   fi
 
-  SOURCE_SHORT_SIDE="$(awk -v width="$SOURCE_WIDTH" -v height="$SOURCE_HEIGHT" \
+  SOURCE_SHORT_SIDE="$(awk -v width="$DISPLAY_WIDTH" -v height="$DISPLAY_HEIGHT" \
     'BEGIN { print (width < height ? width : height) }')"
   if ! awk -v source="$SOURCE_SHORT_SIDE" -v target="$TARGET_SHORT_SIDE" \
     'BEGIN { exit !(source >= target) }'; then
     echo "Файл плохого качества для профиля $COMPRESS_PROFILE:" >&2
-    echo "  разрешение ${SOURCE_WIDTH}x${SOURCE_HEIGHT}, короткая сторона ${SOURCE_SHORT_SIDE}px." >&2
+    echo "  разрешение ${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}, короткая сторона ${SOURCE_SHORT_SIDE}px." >&2
     echo "  профиль требует не менее ${TARGET_SHORT_SIDE}px." >&2
     die "увеличивать разрешение искусственно не буду"
   fi
 
-  TARGET_DIMENSIONS="$(awk -v width="$SOURCE_WIDTH" -v height="$SOURCE_HEIGHT" \
+  TARGET_DIMENSIONS="$(awk -v width="$DISPLAY_WIDTH" -v height="$DISPLAY_HEIGHT" \
     -v target="$TARGET_SHORT_SIDE" 'BEGIN {
       if (width >= height) {
         out_height = target
@@ -1096,52 +1138,62 @@ if [[ "$COMMAND" == "compress" ]]; then
     }')"
   TARGET_WIDTH="${TARGET_DIMENSIONS%% *}"
   TARGET_HEIGHT="${TARGET_DIMENSIONS##* }"
-  FILTER_ARGS=()
-  if [[ "$TARGET_WIDTH" != "$SOURCE_WIDTH" || "$TARGET_HEIGHT" != "$SOURCE_HEIGHT" ]]; then
-    FILTER_ARGS=(-vf "scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:flags=lanczos")
+  SCALE_FILTER=""
+  if [[ "$TARGET_WIDTH" != "$DISPLAY_WIDTH" || "$TARGET_HEIGHT" != "$DISPLAY_HEIGHT" ]]; then
+    SCALE_FILTER="scale=${TARGET_WIDTH}:${TARGET_HEIGHT}:flags=lanczos"
     SCALE_LABEL="${TARGET_WIDTH}x${TARGET_HEIGHT}, Lanczos"
   else
     SCALE_LABEL="${TARGET_WIDTH}x${TARGET_HEIGHT}, без масштабирования"
   fi
 
-  case "$SOURCE_COLOR_TRANSFER" in
-    smpte2084|arib-std-b67)
-      echo "Файл не подходит для профиля $COMPRESS_PROFILE: обнаружен HDR." >&2
-      die "этот профиль предназначен для SDR и мог бы испортить цвета"
-      ;;
-  esac
+  FILTER_CHAIN="$SCALE_FILTER"
+  OUTPUT_PIXEL_FORMAT="yuv420p"
+  OUTPUT_PROFILE="main"
+  OUTPUT_COLOR_ARGS=()
+  COLOR_MODE_LABEL="SDR 8-бит"
 
-  if [[ "$SOURCE_PIX_FMT" == *10* || "$SOURCE_PIX_FMT" == *12* ]]; then
-    echo "Файл не подходит для профиля $COMPRESS_PROFILE: обнаружено $SOURCE_PIX_FMT." >&2
-    die "8-битный профиль мог бы ухудшить цвет, конвертация отменена"
+  if [[ "$HDR_MODE" == "preserve" && ( "$SOURCE_HDR" == "1" || "$SOURCE_HIGH_BIT_DEPTH" == "1" ) ]]; then
+    [[ -n "$FILTER_CHAIN" ]] && FILTER_CHAIN+=","
+    FILTER_CHAIN+="format=p010le"
+    OUTPUT_PIXEL_FORMAT="p010le"
+    OUTPUT_PROFILE="main10"
+    COLOR_MODE_LABEL="HDR 10-бит, сохранён"
+    PRESET_LABEL="${TARGET_SHORT_SIDE}p HDR 10-бит"
+    [[ -n "$SOURCE_COLOR_PRIMARIES" ]] && OUTPUT_COLOR_ARGS+=(-color_primaries "$SOURCE_COLOR_PRIMARIES")
+    [[ -n "$SOURCE_COLOR_TRANSFER" ]] && OUTPUT_COLOR_ARGS+=(-color_trc "$SOURCE_COLOR_TRANSFER")
+    [[ -n "$SOURCE_COLOR_SPACE" ]] && OUTPUT_COLOR_ARGS+=(-colorspace "$SOURCE_COLOR_SPACE")
+    [[ -n "$SOURCE_COLOR_RANGE" ]] && OUTPUT_COLOR_ARGS+=(-color_range "$SOURCE_COLOR_RANGE")
+  elif [[ "$HDR_MODE" == "sdr" && "$SOURCE_HDR" == "1" ]]; then
+    command -v ffmpeg >/dev/null 2>&1 || die "FFmpeg необходим для преобразования HDR в SDR"
+    HLG_BASE="if(lte(val/maxval,0.5),(val/maxval)*(val/maxval)/3,(exp(((val/maxval)-0.55991073)/0.17883277)+0.28466892)/12)"
+    HLG_LINEAR="maxval*min(1,5*(${HLG_BASE}))"
+    PQ_POWER="pow(val/maxval,1/78.84375)"
+    PQ_LINEAR="maxval*min(1,100*pow(max((${PQ_POWER})-0.8359375,0)/(18.8515625-18.6875*(${PQ_POWER})),1/0.1593017578125))"
+    if [[ "$SOURCE_COLOR_TRANSFER" == "arib-std-b67" ]]; then
+      LINEAR_EXPR="$HLG_LINEAR"
+      TONEMAP_PEAK="5"
+    else
+      LINEAR_EXPR="$PQ_LINEAR"
+      TONEMAP_PEAK="100"
+    fi
+    [[ -n "$FILTER_CHAIN" ]] && FILTER_CHAIN+=","
+    FILTER_CHAIN+="format=gbrpf32le,lutrgb=r='${LINEAR_EXPR}':g='${LINEAR_EXPR}':b='${LINEAR_EXPR}',setparams=range=full:color_primaries=bt2020:color_trc=linear:colorspace=gbr,colorspace=space=bt709:primaries=bt709:trc=linear:format=yuv444p10,format=gbrpf32le,tonemap=hable:desat=0:peak=${TONEMAP_PEAK},setparams=range=full:color_primaries=bt709:color_trc=linear:colorspace=gbr,colorspace=all=bt709:format=yuv420p"
+    OUTPUT_COLOR_ARGS=(-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
+    COLOR_MODE_LABEL="HDR → SDR 8-бит, tone mapping"
+  elif [[ "$SOURCE_HIGH_BIT_DEPTH" == "1" ]]; then
+    [[ -n "$FILTER_CHAIN" ]] && FILTER_CHAIN+=","
+    FILTER_CHAIN+="format=yuv420p"
+    COLOR_MODE_LABEL="10/12-бит → SDR 8-бит"
   fi
 
-  if [[ -z "$SOURCE_VIDEO_BITRATE" || "$SOURCE_VIDEO_BITRATE" == "N/A" || "$SOURCE_VIDEO_BITRATE" == "0" ]]; then
-    die "не удалось определить исходный видеобитрейт; безопасная конвертация отменена"
-  fi
+  FILTER_ARGS=()
+  [[ -n "$FILTER_CHAIN" ]] && FILTER_ARGS=(-vf "$FILTER_CHAIN")
 
-  SOURCE_BITRATE_MBPS="$(awk -v bitrate="$SOURCE_VIDEO_BITRATE" \
-    'BEGIN { printf "%.3f", bitrate / 1000000 }')"
-  QUALITY_FACTOR="1"
-  if [[ "$SOURCE_VIDEO_CODEC" == "h264" && "$VIDEO_CODEC" == "hevc" ]]; then
-    QUALITY_FACTOR="1.45"
-  elif [[ "$SOURCE_VIDEO_CODEC" == "hevc" && "$VIDEO_CODEC" == "h264" ]]; then
-    QUALITY_FACTOR="0.60"
-  elif [[ "$SOURCE_VIDEO_CODEC" == "av1" && "$VIDEO_CODEC" == "h264" ]]; then
-    QUALITY_FACTOR="0.50"
-  elif [[ "$SOURCE_VIDEO_CODEC" == "av1" && "$VIDEO_CODEC" == "hevc" ]]; then
-    QUALITY_FACTOR="0.80"
-  fi
-  REQUIRED_SOURCE_BITRATE="$(awk -v bitrate="$VIDEO_BITRATE" -v factor="$QUALITY_FACTOR" \
-    'BEGIN { printf "%.3f", bitrate * factor }')"
-
-  if ! awk -v source="$SOURCE_BITRATE_MBPS" -v required="$REQUIRED_SOURCE_BITRATE" \
-    'BEGIN { exit !(source > required) }'; then
-    echo "Файл плохого качества для профиля $COMPRESS_PROFILE:" >&2
-    echo "  исходный кодек: $SOURCE_VIDEO_CODEC" >&2
-    echo "  исходный битрейт: ${SOURCE_BITRATE_MBPS} Мбит/с" >&2
-    echo "  требуется больше: ${REQUIRED_SOURCE_BITRATE} Мбит/с" >&2
-    die "повторное кодирование не улучшит качество и поэтому отменено"
+  if [[ -n "$SOURCE_VIDEO_BITRATE" && "$SOURCE_VIDEO_BITRATE" != "N/A" && "$SOURCE_VIDEO_BITRATE" != "0" ]]; then
+    SOURCE_BITRATE_MBPS="$(awk -v bitrate="$SOURCE_VIDEO_BITRATE" \
+      'BEGIN { printf "%.3f", bitrate / 1000000 }')"
+  else
+    SOURCE_BITRATE_MBPS="неизвестно"
   fi
 
   GOP_SIZE="$(awk -v fps="$SOURCE_FPS" 'BEGIN {
@@ -1185,7 +1237,7 @@ if [[ "$COMMAND" == "compress" ]]; then
       -c:v "$HARDWARE_ENCODER" \
       -allow_sw 1 \
       -b:v "${VIDEO_BITRATE}M" \
-      -pix_fmt yuv420p \
+      -pix_fmt "$OUTPUT_PIXEL_FORMAT" \
       -f null - >/dev/null 2>&1
     HARDWARE_TEST_STATUS="$?"
     set -e
@@ -1213,7 +1265,8 @@ if [[ "$COMMAND" == "compress" ]]; then
         -keyint_min "$GOP_SIZE"
         -sc_threshold 0
         -bf 2
-        -pix_fmt yuv420p
+        -pix_fmt "$OUTPUT_PIXEL_FORMAT"
+        "${OUTPUT_COLOR_ARGS[@]}"
       )
     else
       VIDEO_ENCODER="h264_videotoolbox"
@@ -1225,7 +1278,8 @@ if [[ "$COMMAND" == "compress" ]]; then
         -b:v "${VIDEO_BITRATE}M"
         -maxrate "${MAX_BITRATE}M"
         -bufsize "${BUFFER_SIZE}M"
-        -pix_fmt yuv420p
+        -pix_fmt "$OUTPUT_PIXEL_FORMAT"
+        "${OUTPUT_COLOR_ARGS[@]}"
         -spatial_aq 1
       )
     fi
@@ -1236,12 +1290,13 @@ if [[ "$COMMAND" == "compress" ]]; then
       VIDEO_ARGS=(
         -c:v libx265
         -preset medium
-        -profile:v main
+        -profile:v "$OUTPUT_PROFILE"
         -b:v "${VIDEO_BITRATE}M"
         -maxrate "${MAX_BITRATE}M"
         -bufsize "${BUFFER_SIZE}M"
         -g "$GOP_SIZE"
-        -pix_fmt yuv420p
+        -pix_fmt "$OUTPUT_PIXEL_FORMAT"
+        "${OUTPUT_COLOR_ARGS[@]}"
         -tag:v hvc1
       )
     else
@@ -1249,13 +1304,14 @@ if [[ "$COMMAND" == "compress" ]]; then
       ENCODER_LABEL="HEVC, VideoToolbox"
       VIDEO_ARGS=(
         -c:v hevc_videotoolbox
-        -profile:v main
+        -profile:v "$OUTPUT_PROFILE"
         -allow_sw 1
         -b:v "${VIDEO_BITRATE}M"
         -maxrate "${MAX_BITRATE}M"
         -bufsize "${BUFFER_SIZE}M"
         -g "$GOP_SIZE"
-        -pix_fmt yuv420p
+        -pix_fmt "$OUTPUT_PIXEL_FORMAT"
+        "${OUTPUT_COLOR_ARGS[@]}"
         -spatial_aq 1
         -tag:v hvc1
       )
@@ -1283,13 +1339,14 @@ if [[ "$COMMAND" == "compress" ]]; then
   fi
 
   echo "Источник:       $INPUT"
-  echo "Исходник:       ${SOURCE_WIDTH}x${SOURCE_HEIGHT}, ${SOURCE_FPS} fps, $SOURCE_VIDEO_CODEC"
+  echo "Исходник:       ${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}, ${SOURCE_FPS} fps, $SOURCE_VIDEO_CODEC"
   if [[ "$TRIM_ACTIVE" == "1" ]]; then
     echo "Фрагмент:       $(format_time "$TRIM_START_SECONDS")–$(format_time "$TRIM_END_SECONDS")"
   fi
   echo "Длительность:   $(format_time "$SOURCE_DURATION")"
   echo "Профиль:        $PRESET_LABEL ($FPS_LABEL)"
   echo "Разрешение:     $SCALE_LABEL"
+  echo "Цвет:           $COLOR_MODE_LABEL"
   echo "Видео:          $ENCODER_LABEL, ${VIDEO_BITRATE} Мбит/с"
   echo "Ускорение:      $ACCELERATION_LABEL"
   echo "Аудио:          $AUDIO_LABEL"

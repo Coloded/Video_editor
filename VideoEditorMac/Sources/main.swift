@@ -288,6 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let fileField = NSTextField()
     private let browseButton = NSButton()
     private let profilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let hdrRadio = NSButton(radioButtonWithTitle: "", target: nil, action: nil)
+    private let sdrRadio = NSButton(radioButtonWithTitle: "", target: nil, action: nil)
     private let cpuCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let startField = NSTextField()
     private let endField = NSTextField()
@@ -338,6 +340,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func profileTitle(_ profile: CompressionProfile) -> String {
+        if let sourceInfo,
+           (sourceInfo.isHDR || sourceInfo.isHighBitDepth),
+           hdrRadio.state == .on {
+            let baseTitle = profile.title.components(separatedBy: "  -  ").first ?? profile.title
+            let baseBitrate = sourceInfo.fps > 30.5 ? profile.highFPSBitrate : profile.standardBitrate
+            let bitrate = profile.videoCodec == "hevc" ? baseBitrate : baseBitrate * 0.60
+            let bitrateText = bitrate.rounded() == bitrate
+                ? String(format: "%.0f", bitrate)
+                : String(format: "%.1f", bitrate)
+            return "\(baseTitle)  -  HEVC HDR 10-bit, \(bitrateText) \(text("Мбит/с", "Mbps"))"
+        }
         guard appLanguage == .en else { return profile.title }
         return profile.title
             .replacingOccurrences(of: "Мбит/с", with: "Mbps")
@@ -515,6 +528,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         browseButton.title = mode == .join ? text("Добавить…", "Add…") : text("Обзор…", "Browse…")
         cpuCheckbox.title = text("Только CPU", "CPU only")
         cpuCheckbox.toolTip = text("Отключить Apple VideoToolbox и кодировать процессором", "Disable Apple VideoToolbox and encode on the CPU")
+        hdrRadio.title = text("HDR 10-бит", "HDR 10-bit")
+        hdrRadio.toolTip = text("Сохранить HDR в HEVC 10-бит", "Preserve HDR as 10-bit HEVC")
+        sdrRadio.title = text("SDR 8-бит", "SDR 8-bit")
+        sdrRadio.toolTip = text("Преобразовать HDR в совместимый SDR с tone mapping", "Convert HDR to compatible SDR with tone mapping")
         timelineView.toolTip = text("Перетащите границы или весь выбранный фрагмент", "Drag either edge or the entire selected range")
         revealButton.title = text("Показать", "Show")
         revealButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: text("Показать в Finder", "Show in Finder"))
@@ -604,7 +621,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         profilePopup.action = #selector(profileChanged(_:))
         profilePopup.controlSize = .large
         profilePopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        profileRow = makeLabeledRow(title: text("Профиль", "Profile"), control: profilePopup)
+        hdrRadio.title = text("HDR 10-бит", "HDR 10-bit")
+        hdrRadio.toolTip = text("Сохранить HDR в HEVC 10-бит", "Preserve HDR as 10-bit HEVC")
+        hdrRadio.target = self
+        hdrRadio.action = #selector(hdrModeChanged(_:))
+        hdrRadio.isEnabled = false
+        sdrRadio.title = text("SDR 8-бит", "SDR 8-bit")
+        sdrRadio.toolTip = text("Преобразовать HDR в совместимый SDR с tone mapping", "Convert HDR to compatible SDR with tone mapping")
+        sdrRadio.target = self
+        sdrRadio.action = #selector(hdrModeChanged(_:))
+        sdrRadio.state = .on
+        sdrRadio.isEnabled = false
+        let profileControls = NSStackView(views: [profilePopup, hdrRadio, sdrRadio])
+        profileControls.orientation = .horizontal
+        profileControls.alignment = .centerY
+        profileControls.spacing = 12
+        profileRow = makeLabeledRow(title: text("Профиль", "Profile"), control: profileControls)
 
         cpuCheckbox.title = text("Только CPU", "CPU only")
         cpuCheckbox.toolTip = text("Отключить Apple VideoToolbox и кодировать процессором", "Disable Apple VideoToolbox and encode on the CPU")
@@ -1294,6 +1326,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func selectInput(_ url: URL) {
         analysisToken = UUID()
         sourceInfo = nil
+        hdrRadio.state = .off
+        sdrRadio.state = .on
+        hdrRadio.isEnabled = false
+        sdrRadio.isEnabled = false
         selectedInputURL = url
         fileField.stringValue = url.path
         fileField.toolTip = url.path
@@ -1359,7 +1395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         task.executableURL = ffprobe
         task.arguments = [
             "-v", "error",
-            "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt,color_transfer,avg_frame_rate,bit_rate:format=bit_rate,duration",
+            "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt,color_transfer,avg_frame_rate,bit_rate:stream_side_data=rotation:format=bit_rate,duration",
             "-of", "json",
             url.path
         ]
@@ -1378,9 +1414,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
               let video = streams.first(where: { stringValue($0["codec_type"]) == "video" }) else { return nil }
 
         let format = root["format"] as? [String: Any] ?? [:]
-        let width = intValue(video["width"])
-        let height = intValue(video["height"])
-        guard width > 0, height > 0 else { return nil }
+        let codedWidth = intValue(video["width"])
+        let codedHeight = intValue(video["height"])
+        guard codedWidth > 0, codedHeight > 0 else { return nil }
+        let sideData = video["side_data_list"] as? [[String: Any]] ?? []
+        let rotation = sideData.lazy.map { self.intValue($0["rotation"]) }.first { $0 != 0 } ?? 0
+        let isQuarterTurn = abs(rotation) == 90 || abs(rotation) == 270
+        let width = isQuarterTurn ? codedHeight : codedWidth
+        let height = isQuarterTurn ? codedWidth : codedHeight
 
         let streamBitrate = doubleValue(video["bit_rate"])
         let formatBitrate = doubleValue(format["bit_rate"])
@@ -1397,6 +1438,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func applyAvailableProfiles(for info: SourceInfo) {
+        let supportsHDRChoice = info.isHDR || info.isHighBitDepth
+        if supportsHDRChoice && !hdrRadio.isEnabled {
+            hdrRadio.state = .on
+            sdrRadio.state = .off
+        } else if !supportsHDRChoice {
+            hdrRadio.state = .off
+            sdrRadio.state = .on
+        }
+        hdrRadio.isEnabled = supportsHDRChoice && process?.isRunning != true
+        sdrRadio.isEnabled = supportsHDRChoice && process?.isRunning != true
         availableProfiles = compressionProfiles(for: info)
 
         profilePopup.removeAllItems()
@@ -1405,11 +1456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             profilePopup.isEnabled = false
             startButton.isEnabled = false
             statusLabel.stringValue = text("Нет подходящего профиля", "No suitable profile")
-            if info.isHDR || info.isHighBitDepth {
-                detailLabel.stringValue = text("Обнаружено HDR или 10-битное видео", "HDR or 10-bit video detected")
-            } else {
-                detailLabel.stringValue = text("Разрешение или битрейт исходника ниже минимальных требований", "The source resolution or bitrate is below the minimum requirements")
-            }
+            detailLabel.stringValue = text("Разрешение или битрейт исходника ниже минимальных требований", "The source resolution or bitrate is below the minimum requirements")
             return
         }
 
@@ -1434,22 +1481,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         preferredProfileID = availableProfiles[sender.indexOfSelectedItem].id
     }
 
+    @objc private func hdrModeChanged(_ sender: NSButton) {
+        let preserveHDR = sender === hdrRadio
+        hdrRadio.state = preserveHDR ? .on : .off
+        sdrRadio.state = preserveHDR ? .off : .on
+        guard let sourceInfo else { return }
+        applyAvailableProfiles(for: sourceInfo)
+    }
+
     private func compressionProfiles(for info: SourceInfo) -> [CompressionProfile] {
         profiles.filter { isProfileAvailable($0, for: info) }
     }
 
     private func isProfileAvailable(_ profile: CompressionProfile, for info: SourceInfo) -> Bool {
-        guard !info.isHDR, !info.isHighBitDepth, info.shortSide >= profile.targetShortSide else { return false }
-        let targetBitrate = info.fps > 30.5 ? profile.highFPSBitrate : profile.standardBitrate
-        let factor: Double
-        switch (info.codec, profile.videoCodec) {
-        case ("h264", "hevc"): factor = 1.45
-        case ("hevc", "h264"): factor = 0.60
-        case ("av1", "h264"): factor = 0.50
-        case ("av1", "hevc"): factor = 0.80
-        default: factor = 1
-        }
-        return info.videoBitrate > targetBitrate * factor
+        info.shortSide >= profile.targetShortSide
     }
 
     private func locateTool(named name: String) -> URL? {
@@ -1843,6 +1888,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard availableProfiles.indices.contains(profilePopup.indexOfSelectedItem) else { return }
             let profile = availableProfiles[profilePopup.indexOfSelectedItem]
             arguments = ["compress", profile.id]
+            if let sourceInfo, sourceInfo.isHDR || sourceInfo.isHighBitDepth {
+                arguments.append(hdrRadio.state == .on ? "--preserve-hdr" : "--convert-sdr")
+            }
             if cpuCheckbox.state == .on {
                 arguments.append("--no-gpu")
             }
@@ -1850,6 +1898,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .cut:
             if let profile = pendingCompressionProfile {
                 arguments = ["compress", profile.id, "-s", startField.stringValue, "-e", endField.stringValue]
+                if let sourceInfo, sourceInfo.isHDR || sourceInfo.isHighBitDepth {
+                    arguments.append(hdrRadio.state == .on ? "--preserve-hdr" : "--convert-sdr")
+                }
             } else {
                 arguments = ["cut", "-s", startField.stringValue, "-e", endField.stringValue]
             }
@@ -2188,6 +2239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         modeControl.isEnabled = !running
         browseButton.isEnabled = !running
         profilePopup.isEnabled = !running && !availableProfiles.isEmpty
+        let supportsHDRChoice = sourceInfo?.isHDR == true || sourceInfo?.isHighBitDepth == true
+        hdrRadio.isEnabled = !running && supportsHDRChoice
+        sdrRadio.isEnabled = !running && supportsHDRChoice
         cpuCheckbox.isEnabled = !running
         startField.isEnabled = !running
         endField.isEnabled = !running
