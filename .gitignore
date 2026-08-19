@@ -18,8 +18,8 @@
 /*.HEIC
 /*.rtf
 
-# Generated application bundle (the distributable ZIP is kept in dist/)
-/Video Editor.app/
+# Generated application bundle (release DMG files are kept in dist/)
+/Video_Editor.app/
 
 # Local standalone CLI helpers (not part of the macOS application source)
 /video_editor

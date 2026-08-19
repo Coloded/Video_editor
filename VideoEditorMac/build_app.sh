@@ -7,12 +7,16 @@ SOURCE="$ROOT/Sources/main.swift"
 PLIST="$ROOT/Info.plist"
 ENGINE="$ROOT/Resources/video_engine"
 ICON="$ROOT/Resources/AppIcon-master.png"
-APP="$WORKSPACE/Video Editor.app"
+INSTALL_DIR="/Applications"
+APP="$INSTALL_DIR/Video_Editor.app"
+LEGACY_APP="$INSTALL_DIR/Video Editor.app"
+DIST="$WORKSPACE/dist"
 
 CHECK_ONLY=0
 SKIP_RUNTIME_CHECK=0
 STAGING=""
 PREVIOUS_APP=""
+PREVIOUS_LEGACY_APP=""
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
@@ -64,6 +68,11 @@ cleanup() {
   if [[ -n "$PREVIOUS_APP" && -e "$PREVIOUS_APP" && ! -e "$APP" ]]; then
     warn "Восстанавливаю предыдущую сборку после прерывания."
     mv "$PREVIOUS_APP" "$APP" || warn "Не удалось автоматически восстановить: $APP"
+  fi
+  if [[ -n "$PREVIOUS_LEGACY_APP" && -e "$PREVIOUS_LEGACY_APP" && ! -e "$LEGACY_APP" ]]; then
+    warn "Восстанавливаю приложение со старым именем после прерывания."
+    mv "$PREVIOUS_LEGACY_APP" "$LEGACY_APP" || \
+      warn "Не удалось автоматически восстановить: $LEGACY_APP"
   fi
   if [[ -n "$STAGING" && -d "$STAGING" && "${STAGING:t}" == video-editor-app.* ]]; then
     rm -rf -- "$STAGING"
@@ -152,6 +161,9 @@ check_input_file "$ENGINE" "внутренний video_engine"
 check_input_file "$ICON" "исходную иконку"
 [[ -d "$WORKSPACE" ]] || die "не найдена папка проекта: $WORKSPACE"
 [[ -w "$WORKSPACE" ]] || die "нет прав на запись в папку проекта: $WORKSPACE"
+[[ -d "$INSTALL_DIR" ]] || die "не найдена системная папка приложений: $INSTALL_DIR"
+[[ -w "$INSTALL_DIR" ]] || \
+  die "нет прав на запись в $INSTALL_DIR. Запустите сборку из учётной записи администратора или установите готовый DMG вручную"
 
 command -v xcrun >/dev/null 2>&1 || request_command_line_tools
 
@@ -159,6 +171,7 @@ for specification in \
   "sips:системная утилита обработки изображений отсутствует" \
   "plutil:системная утилита проверки plist отсутствует" \
   "codesign:системная утилита подписи отсутствует" \
+  "hdiutil:системная утилита создания DMG отсутствует" \
   "lipo:установите или обновите Apple Command Line Tools" \
   "perl:системный Perl необходим для создания icns" \
   "stat:системная команда stat отсутствует" \
@@ -171,6 +184,7 @@ for specification in \
   "mv:системная команда mv отсутствует" \
   "rm:системная команда rm отсутствует" \
   "mkdir:системная команда mkdir отсутствует" \
+  "ln:системная команда ln отсутствует" \
   "mktemp:системная команда mktemp отсутствует" \
   "chmod:системная команда chmod отсутствует" \
   "cat:системная команда cat отсутствует"; do
@@ -198,6 +212,10 @@ fi
 success "$(print -r -- "$SWIFT_VERSION" | head -n 1)"
 
 plutil -lint "$PLIST" >/dev/null || die "Info.plist содержит ошибку"
+APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$PLIST" 2>/dev/null || true)"
+if [[ ! "$APP_VERSION" =~ '^[0-9]+([.][0-9]+)*$' ]]; then
+  die "в Info.plist указан некорректный CFBundleShortVersionString: '${APP_VERSION:-пусто}'"
+fi
 ENGINE_SYNTAX=""
 if ! ENGINE_SYNTAX="$(zsh -n "$ENGINE" 2>&1)"; then
   print -ru2 -- "$ENGINE_SYNTAX"
@@ -228,7 +246,7 @@ fi
 if ! STAGING="$(mktemp -d -t video-editor-app.XXXXXX)" || [[ ! -d "$STAGING" ]]; then
   die "не удалось создать временную папку для сборки"
 fi
-STAGED_APP="$STAGING/Video Editor.app"
+STAGED_APP="$STAGING/Video_Editor.app"
 mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources" || \
   die "не удалось создать структуру приложения во временной папке"
 
@@ -316,19 +334,55 @@ file "$STAGED_APP/Contents/MacOS/VideoEditor" | grep -q 'arm64' || \
 codesign --force --deep --sign - "$STAGED_APP" >/dev/null || die "не удалось подписать приложение ad-hoc подписью"
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP" || die "проверка подписи приложения завершилась ошибкой"
 
+info "Создаю установочный DMG"
+mkdir -p "$DIST" || die "не удалось создать папку готовых сборок: $DIST"
+[[ -w "$DIST" ]] || die "нет прав на запись в папку готовых сборок: $DIST"
+DMG_ROOT="$STAGING/DMG"
+DMG_TEMP="$STAGING/Video-Editor-${APP_VERSION}-arm64.dmg"
+DMG="$DIST/Video-Editor-${APP_VERSION}-arm64.dmg"
+mkdir -p "$DMG_ROOT" || die "не удалось создать временную папку для DMG"
+cp -R "$STAGED_APP" "$DMG_ROOT/Video_Editor.app" || \
+  die "не удалось добавить приложение в DMG"
+ln -s /Applications "$DMG_ROOT/Applications" || \
+  die "не удалось добавить ссылку на папку Applications в DMG"
+if ! hdiutil create \
+  -volname "Video Editor ${APP_VERSION}" \
+  -srcfolder "$DMG_ROOT" \
+  -format UDZO \
+  -ov \
+  "$DMG_TEMP"; then
+  die "hdiutil не смог создать установочный DMG"
+fi
+[[ -s "$DMG_TEMP" ]] || die "созданный DMG отсутствует или пуст: $DMG_TEMP"
+hdiutil verify "$DMG_TEMP" >/dev/null || die "проверка целостности DMG завершилась ошибкой"
+
 if [[ -e "$APP" ]]; then
-  PREVIOUS_APP="$STAGING/Previous Video Editor.app"
+  PREVIOUS_APP="$STAGING/Previous Video_Editor.app"
   mv "$APP" "$PREVIOUS_APP" || die "не удалось временно убрать предыдущую сборку: $APP"
+fi
+if [[ -e "$LEGACY_APP" ]]; then
+  PREVIOUS_LEGACY_APP="$STAGING/Previous legacy Video Editor.app"
+  mv "$LEGACY_APP" "$PREVIOUS_LEGACY_APP" || \
+    die "не удалось временно убрать приложение со старым именем: $LEGACY_APP"
 fi
 if ! mv "$STAGED_APP" "$APP"; then
   if [[ -n "$PREVIOUS_APP" && -e "$PREVIOUS_APP" ]]; then
     mv "$PREVIOUS_APP" "$APP" || true
+  fi
+  if [[ -n "$PREVIOUS_LEGACY_APP" && -e "$PREVIOUS_LEGACY_APP" ]]; then
+    mv "$PREVIOUS_LEGACY_APP" "$LEGACY_APP" || true
   fi
   die "не удалось поместить готовое приложение в $APP; предыдущая сборка восстановлена"
 fi
 if [[ -n "$PREVIOUS_APP" && -e "$PREVIOUS_APP" ]]; then
   rm -rf -- "$PREVIOUS_APP"
 fi
+if [[ -n "$PREVIOUS_LEGACY_APP" && -e "$PREVIOUS_LEGACY_APP" ]]; then
+  rm -rf -- "$PREVIOUS_LEGACY_APP"
+fi
+mv -f "$DMG_TEMP" "$DMG" || die "не удалось сохранить готовый DMG: $DMG"
 
-success "Сборка завершена"
+success "Приложение собрано и установлено"
 print -r -- "$APP"
+success "Установочный образ создан"
+print -r -- "$DMG"
