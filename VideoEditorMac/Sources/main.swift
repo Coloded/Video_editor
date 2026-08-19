@@ -261,6 +261,12 @@ private final class RangeTimelineView: NSControl {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate,
                          NSTableViewDataSource, NSTableViewDelegate {
     private var appLanguage = AppLanguage.initial()
+    private let videoInputExtensions = [
+        "mov", "mp4", "m4v", "mkv", "avi", "webm", "mpg", "mpeg",
+        "ts", "mts", "m2ts", "vob", "3gp", "flv", "wmv", "ogv"
+    ]
+    private let audioInputExtensions = ["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus"]
+    private let compressedOutputExtensions = ["mp4", "mov", "mkv"]
     private let profiles = [
         CompressionProfile(id: "240", title: "240p  -  H.264, 0.6 Мбит/с", suffix: "240p", targetShortSide: 240, standardBitrate: 0.6, highFPSBitrate: 0.9, videoCodec: "h264"),
         CompressionProfile(id: "360", title: "360p  -  H.264, 1 Мбит/с", suffix: "360p", targetShortSide: 360, standardBitrate: 1, highFPSBitrate: 1.5, videoCodec: "h264"),
@@ -337,6 +343,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func text(_ russian: String, _ english: String) -> String {
         appLanguage == .ru ? russian : english
+    }
+
+    private func contentTypes(for extensions: [String]) -> [UTType] {
+        extensions.compactMap { UTType(filenameExtension: $0) }
     }
 
     private func profileTitle(_ profile: CompressionProfile) -> String {
@@ -1175,8 +1185,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = mode == .join
-        panel.allowedContentTypes = mode == .cut ? [.movie, .audio] : [.movie]
-        panel.allowsOtherFileTypes = true
+        let inputExtensions = mode == .cut
+            ? videoInputExtensions + audioInputExtensions
+            : videoInputExtensions
+        panel.allowedContentTypes = contentTypes(for: inputExtensions)
+        panel.allowsOtherFileTypes = false
 
         guard panel.runModal() == .OK else { return }
         if mode == .join {
@@ -1787,6 +1800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         savePanel.directoryURL = inputURL.deletingLastPathComponent()
         savePanel.canCreateDirectories = true
         savePanel.prompt = text("Сохранить", "Save")
+        savePanel.allowsOtherFileTypes = false
 
         let stem = inputURL.deletingPathExtension().lastPathComponent
         switch mode {
@@ -1801,17 +1815,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             let profile = availableProfiles[profilePopup.indexOfSelectedItem]
             savePanel.title = text("Куда сохранить сжатое видео", "Save compressed video")
             savePanel.nameFieldStringValue = "\(stem).\(profile.suffix).mp4"
-            savePanel.allowedContentTypes = [.mpeg4Movie]
+            savePanel.allowedContentTypes = contentTypes(for: compressedOutputExtensions)
         case .cut:
             let ext = inputURL.pathExtension.isEmpty ? "mkv" : inputURL.pathExtension
             savePanel.title = text("Куда сохранить фрагмент", "Save clip")
             savePanel.nameFieldStringValue = "\(stem).cut.\(ext)"
             savePanel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .audiovisualContent]
-            savePanel.allowsOtherFileTypes = true
         case .join:
             savePanel.title = text("Куда сохранить склеенное видео", "Save joined video")
             savePanel.nameFieldStringValue = "\(stem).joined.mp4"
-            savePanel.allowedContentTypes = [.mpeg4Movie]
+            savePanel.allowedContentTypes = contentTypes(for: compressedOutputExtensions)
         }
 
         guard savePanel.runModal() == .OK, var outputURL = savePanel.url else { return }
@@ -1836,10 +1849,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 break
             case .profile(let profile):
                 pendingCompressionProfile = profile
-                if outputURL.pathExtension.lowercased() != "mp4" {
+                if !compressedOutputExtensions.contains(outputURL.pathExtension.lowercased()) {
                     outputURL = outputURL.deletingPathExtension().appendingPathExtension("mp4")
                 }
             }
+        }
+
+        if mode == .compress || mode == .join,
+           !compressedOutputExtensions.contains(outputURL.pathExtension.lowercased()) {
+            outputURL = outputURL.deletingPathExtension().appendingPathExtension("mp4")
         }
 
         beginProcess(inputURL: inputURL, outputURL: outputURL)

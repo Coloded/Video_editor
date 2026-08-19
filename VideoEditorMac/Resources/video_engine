@@ -52,7 +52,7 @@ video_editor — вырезание, сжатие и склейка аудио/�
 Команды:
   cut                    Вырезать фрагмент без повторного кодирования
   compress PROFILE       Сжать видео по явно указанному профилю
-  join                    Склеить ролики из манифеста в один MP4
+  join                    Склеить ролики из манифеста в MP4, MOV или MKV
   help                   Показать эту справку
 
 Команда cut используется по умолчанию, поэтому её можно не писать. Для cut,
@@ -90,15 +90,15 @@ video_editor — вырезание, сжатие и склейка аудио/�
 кодировщик и скорость записи; снизу прогресс, время и прогноз размера.
 
 Профили сжатия:
-  240                    MP4, H.264, до 426x240, 0.6 Мбит/с
-  360                    MP4, H.264, до 640x360, 1 Мбит/с
-  480                    MP4, H.264, до 854x480, 2.5 Мбит/с
-  720                    MP4, H.264, до 1280x720, 5 Мбит/с
-  1080                   MP4, H.264, до 1920x1080, 8 Мбит/с
-  1440                   MP4, H.264, до 2560x1440, 16 Мбит/с
-  2160                   MP4, H.264, до 3840x2160, 40 Мбит/с
+  240                    H.264, до 426x240, 0.6 Мбит/с
+  360                    H.264, до 640x360, 1 Мбит/с
+  480                    H.264, до 854x480, 2.5 Мбит/с
+  720                    H.264, до 1280x720, 5 Мбит/с
+  1080                   H.264, до 1920x1080, 8 Мбит/с
+  1440                   H.264, до 2560x1440, 16 Мбит/с
+  2160                   H.264, до 3840x2160, 40 Мбит/с
   youtube                То же, что 2160: YouTube 4K SDR
-  youtube-compact        MP4, 4K, HEVC, 24 Мбит/с, AAC, Fast Start
+  youtube-compact        4K, HEVC, 24 Мбит/с, AAC
 
   Для видео 50/60 fps битрейт автоматически увеличивается. Число профиля —
   короткая сторона кадра: горизонтальное и вертикальное видео поддерживаются.
@@ -128,7 +128,7 @@ video_editor — вырезание, сжатие и склейка аудио/�
 
 Результат сохраняется рядом с исходником. Cut копирует потоки без изменения
 качества. Compress сохраняет частоту кадров и пропорции, уменьшает разрешение
-до выбранного профиля и создаёт совместимый с macOS MP4.
+до выбранного профиля и создаёт MP4, MOV или MKV по расширению результата.
 EOF
 }
 
@@ -511,6 +511,11 @@ run_join() {
   else
     output="$first_dir/$first_name.joined.mp4"
   fi
+  local output_extension="${output:e:l}"
+  case "$output_extension" in
+    mp4|mov|mkv) ;;
+    *) die "для склейки выберите выходной формат .mp4, .mov или .mkv" ;;
+  esac
   output="$(unique_output_path "$output")"
   [[ -d "${output:h}" ]] || die "папка результата не существует: ${output:h}"
 
@@ -558,7 +563,7 @@ run_join() {
     if [[ "$output_codec" == "hevc" ]]; then
       video_encoder="libx265"
       encoder_label="CPU libx265"
-      video_args=(-c:v "$video_encoder" -preset medium -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -pix_fmt yuv420p -tag:v hvc1)
+      video_args=(-c:v "$video_encoder" -preset medium -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -pix_fmt yuv420p)
     else
       video_encoder="libx264"
       encoder_label="CPU libx264"
@@ -566,7 +571,16 @@ run_join() {
     fi
   fi
 
-  local temp_output="${output%.*}.tmp.$$.mp4"
+  if [[ "$output_codec" == "hevc" && ( "$output_extension" == "mp4" || "$output_extension" == "mov" ) ]]; then
+    video_args+=(-tag:v hvc1)
+  fi
+
+  local temp_output="${output%.*}.tmp.$$.${output_extension}"
+  local -a muxer_args
+  muxer_args=()
+  if [[ "$output_extension" == "mp4" || "$output_extension" == "mov" ]]; then
+    muxer_args=(-movflags +faststart)
+  fi
   local error_log
   error_log="$(mktemp -t video-editor-join.XXXXXX)"
   local progress_pipe
@@ -633,7 +647,7 @@ run_join() {
     -ac 2 \
     -map_metadata -1 \
     -map_chapters -1 \
-    -movflags +faststart \
+    "${muxer_args[@]}" \
     "$temp_output" >/dev/null 2>"$error_log" &
   FFMPEG_PID="$!"
 
@@ -1213,12 +1227,22 @@ if [[ "$COMMAND" == "compress" ]]; then
   else
     OUTPUT="$INPUT_DIR/$STEM.$OUTPUT_SUFFIX.mp4"
   fi
-  [[ "${OUTPUT:l}" == *.mp4 ]] || die "для сжатия укажите выходной файл с расширением .mp4"
+  OUTPUT_EXTENSION="${OUTPUT:e:l}"
+  case "$OUTPUT_EXTENSION" in
+    mp4|mov|mkv) ;;
+    *) die "для сжатия выберите выходной формат .mp4, .mov или .mkv" ;;
+  esac
   OUTPUT="$(unique_output_path "$OUTPUT")"
   OUTPUT_DIR="${OUTPUT:h}"
   [[ -d "$OUTPUT_DIR" ]] || die "папка результата не существует: $OUTPUT_DIR"
 
-  TEMP_OUTPUT="${OUTPUT%.*}.tmp.$$.mp4"
+  TEMP_OUTPUT="${OUTPUT%.*}.tmp.$$.${OUTPUT_EXTENSION}"
+  MUXER_ARGS=()
+  HEVC_TAG_ARGS=()
+  if [[ "$OUTPUT_EXTENSION" == "mp4" || "$OUTPUT_EXTENSION" == "mov" ]]; then
+    MUXER_ARGS=(-movflags +faststart -use_editlist 0)
+    HEVC_TAG_ARGS=(-tag:v hvc1)
+  fi
   ERROR_LOG="$(mktemp -t video-editor-compress.XXXXXX)"
   TMP_FILES+=("$TEMP_OUTPUT" "$ERROR_LOG")
 
@@ -1297,7 +1321,7 @@ if [[ "$COMMAND" == "compress" ]]; then
         -g "$GOP_SIZE"
         -pix_fmt "$OUTPUT_PIXEL_FORMAT"
         "${OUTPUT_COLOR_ARGS[@]}"
-        -tag:v hvc1
+        "${HEVC_TAG_ARGS[@]}"
       )
     else
       VIDEO_ENCODER="hevc_videotoolbox"
@@ -1313,7 +1337,7 @@ if [[ "$COMMAND" == "compress" ]]; then
         -pix_fmt "$OUTPUT_PIXEL_FORMAT"
         "${OUTPUT_COLOR_ARGS[@]}"
         -spatial_aq 1
-        -tag:v hvc1
+        "${HEVC_TAG_ARGS[@]}"
       )
     fi
   fi
@@ -1489,8 +1513,7 @@ if [[ "$COMMAND" == "compress" ]]; then
     "${FILTER_ARGS[@]}" \
     "${VIDEO_ARGS[@]}" \
     -fps_mode passthrough \
-    -movflags +faststart \
-    -use_editlist 0 \
+    "${MUXER_ARGS[@]}" \
     "$TEMP_OUTPUT" > /dev/null 2>"$ERROR_LOG" &
   FFMPEG_PID="$!"
 
