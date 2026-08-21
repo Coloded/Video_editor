@@ -6,7 +6,7 @@
 
 Video Editor — простое и полностью бесплатное приложение для компьютеров Mac с процессорами Apple Silicon и macOS 13 Ventura или новее. Оно позволяет сжимать видео, вырезать фрагменты и объединять несколько роликов в одном нативном интерфейсе macOS.
 
-Готовый установочный образ: [`dist/Video-Editor-3.7-arm64.dmg`](dist/Video-Editor-3.7-arm64.dmg).
+Готовый установочный образ: [`dist/Video-Editor-3.7.1-arm64.dmg`](dist/Video-Editor-3.7.1-arm64.dmg).
 
 Постоянная ссылка на последнюю стабильную версию: [Video_Editor-stable.dmg](https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg).
 
@@ -183,7 +183,7 @@ FFmpeg не встроен в приложение. При первом запу
 
 ## Установка готового приложения
 
-1. Скачайте и откройте [`Video-Editor-3.7-arm64.dmg`](dist/Video-Editor-3.7-arm64.dmg).
+1. Скачайте и откройте [`Video-Editor-3.7.1-arm64.dmg`](dist/Video-Editor-3.7.1-arm64.dmg).
 2. Перетащите `Video_Editor.app` на находящийся рядом ярлык `Applications`.
 3. Установите FFmpeg командой `brew install ffmpeg`, если он ещё не установлен.
 4. Запустите приложение.

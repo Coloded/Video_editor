@@ -3,22 +3,21 @@
     <channel>
         <title>Video_Editor</title>
         <item>
-            <title>3.7</title>
-            <pubDate>Fri, 21 Aug 2026 13:22:52 +0300</pubDate>
+            <title>3.7.1</title>
+            <pubDate>Fri, 21 Aug 2026 13:41:00 +0300</pubDate>
             <link>https://github.com/Coloded/Video_editor</link>
-            <sparkle:version>13</sparkle:version>
-            <sparkle:shortVersionString>3.7</sparkle:shortVersionString>
+            <sparkle:version>14</sparkle:version>
+            <sparkle:shortVersionString>3.7.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# Video Editor 3.7
+            <description sparkle:format="markdown"><![CDATA[# Video Editor 3.7.1
 
-- Добавлена безопасная проверка обновлений через Sparkle 2.
-- В меню приложения появилась команда «Проверить обновления…».
-- Приложение автоматически проверяет наличие новой стабильной версии и спрашивает подтверждение перед установкой.
-- Для каждого релиза создаётся постоянный образ `Video_Editor-stable.dmg`.
-- Обновления проверяются криптографической подписью EdDSA перед установкой.
+- Полностью переведены технические сведения в английском интерфейсе.
+- Убраны оставшиеся русские слова из режимов Compress, Cut и Join.
+- Исправлен перевод единиц скорости записи, параметров видео и аудио, режима цвета и состояния VideoToolbox.
+- Динамические подписи теперь корректно меняют язык без перезапуска приложения.
 ]]></description>
-            <enclosure url="https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg" length="3515152" type="application/octet-stream" sparkle:edSignature="vrNHPXYPWiwW5oBSvTQrh7O+BuZCN7OuFu7JPGIhM0/jAr85jlvxLunjSCsjJZ42dU8BSzopc0I6+EWXn7NjAw=="/>
+            <enclosure url="https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg" length="3519656" type="application/octet-stream" sparkle:edSignature="XijpTV0sRJpcX91QPl8bMZa0/6AgHEvq0u4KtPvdc68NXzgPsOStiYIA9Zdc99Dot7FXvA0zK9mWJjCEWNTJDg=="/>
         </item>
     </channel>
 </rss>

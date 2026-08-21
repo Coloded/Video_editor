@@ -327,6 +327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let sizeLabel = NSTextField(labelWithString: "")
     private let technicalLabel = NSTextField(wrappingLabelWithString: "")
     private var technicalValues: [String: String] = [:]
+    private var rawEngineResourceText: String?
+    private var rawEngineSizeText: String?
 
     private let startButton = NSButton()
     private let revealButton = NSButton()
@@ -525,7 +527,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 return text(russian, english) + value.dropFirst(english.count)
             }
         }
-        return value
+        let dynamicPairs = [
+            ("Длительность ", "Duration "),
+            ("Ролик ", "Clip "),
+            (" из ", " of "),
+            ("фрагмент: ", "selection: "),
+            ("Прошло ", "Elapsed "),
+            ("Осталось ", "Remaining "),
+            ("Скорость ", "Speed "),
+            ("Мбит/с", "Mbps"),
+            ("профилей: ", "profiles: ")
+        ]
+        return dynamicPairs.reduce(value) { result, pair in
+            let from = appLanguage == .en ? pair.0 : pair.1
+            let to = appLanguage == .en ? pair.1 : pair.0
+            return result.replacingOccurrences(of: from, with: to)
+        }
     }
 
     private func applyLanguage() {
@@ -574,6 +591,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
         updateTechnicalDetails()
+        if let rawEngineResourceText {
+            resourceLabel.stringValue = localizedEngineText(rawEngineResourceText)
+        }
+        if let rawEngineSizeText {
+            sizeLabel.stringValue = localizedEngineText(rawEngineSizeText)
+        }
         joinTable.reloadData()
         if timelineView.isEnabled {
             updateSelectionLabel()
@@ -938,18 +961,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 switch self.mode {
                 case .compress:
                     self.processLine("Профиль: 1080p Full HD SDR", isError: false)
+                    self.processLine("Разрешение: 1920x1080, без масштабирования", isError: false)
+                    self.processLine("Цвет: HDR → SDR 8-бит, tone mapping", isError: false)
+                    self.processLine("Видео: H.264, процессор, 8.000 Мбит/с", isError: false)
+                    self.processLine("Аудио: нет аудиодорожки", isError: false)
+                    self.processLine("Ускорение: CPU (VideoToolbox отключён или недоступен)", isError: false)
                     self.statusLabel.stringValue = self.text("Сжимаю видео", "Compressing video")
                 case .cut:
                     self.processLine("Профиль: Без повторного кодирования", isError: false)
+                    self.processLine("Исходник: аудио, неизвестный кодек", isError: false)
+                    self.processLine("Разрешение: 1920x1080, без изменений", isError: false)
+                    self.processLine("Видео: H264, копирование", isError: false)
+                    self.processLine("Аудио: нет аудиодорожки", isError: false)
+                    self.processLine("Ускорение: не требуется, потоки копируются", isError: false)
+                    self.processLine("Режим: вырезание без повторного кодирования", isError: false)
                     self.statusLabel.stringValue = self.text("Вырезаю фрагмент", "Cutting clip")
                 case .join:
-                    self.processLine("Профиль: Без дополнительного сжатия", isError: false)
+                    self.processLine("Профиль: YouTube компактный 4K SDR", isError: false)
+                    self.processLine("Исходник: 21 роликов, первый 1920x1080, h264", isError: false)
+                    self.processLine("Разрешение: 1920x1080, 29.970 fps", isError: false)
+                    self.processLine("Видео: H264, процессор, 8.000 Мбит/с", isError: false)
+                    self.processLine("Аудио: AAC, 48 кГц, стерео", isError: false)
+                    self.processLine("Ускорение: CPU (VideoToolbox отключён или недоступен)", isError: false)
                     self.statusLabel.stringValue = self.text("Склеиваю ролики", "Joining clips")
                 }
-                self.processLine("Исходник: 3840x2160, 23.976 fps, h264", isError: false)
-                self.processLine("Видео: H.264, VideoToolbox, 8.000 Мбит/с", isError: false)
-                self.processLine("Аудио: AAC, 48 кГц, стерео", isError: false)
-                self.processLine("Ускорение: Apple VideoToolbox (аппаратный медиадвижок)", isError: false)
                 let cores = ProcessInfo.processInfo.activeProcessorCount
                 let ram = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
                 self.processLine("Ресурсы: CPU 62% (6.2/\(cores)) | RAM 420.0 МБ / \(String(format: "%.0f", ram)) ГБ | Media Engine VT | запись 7.1 МБ/с", isError: false)
@@ -2012,6 +2047,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         playerView.player?.pause()
         setRunning(true)
         technicalValues.removeAll()
+        rawEngineResourceText = nil
+        rawEngineSizeText = nil
         technicalLabel.stringValue = ""
         technicalLabel.isHidden = true
 
@@ -2120,14 +2157,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard !line.isEmpty else { return }
 
         if line.hasPrefix("Ресурсы:") {
-            resourceLabel.stringValue = localizedEngineText(
-                line.replacingOccurrences(of: "Ресурсы:", with: "").trimmingCharacters(in: .whitespaces)
-            )
+            let rawResource = line.replacingOccurrences(of: "Ресурсы:", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            rawEngineResourceText = rawResource
+            resourceLabel.stringValue = localizedEngineText(rawResource)
             resourceLabel.isHidden = false
             return
         }
 
-        let technicalKeys = ["Профиль", "Исходник", "Разрешение", "Видео", "Аудио", "Ускорение", "Режим"]
+        let technicalKeys = ["Профиль", "Исходник", "Разрешение", "Цвет", "Видео", "Аудио", "Ускорение", "Режим"]
         if let key = technicalKeys.first(where: { line.hasPrefix("\($0):") }) {
             technicalValues[key] = String(line.dropFirst(key.count + 1)).trimmingCharacters(in: .whitespaces)
             updateTechnicalDetails()
@@ -2164,9 +2202,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             detailLabel.stringValue = details.joined(separator: "   •   ")
 
             if let sizes = capture(#"Исходники\s+(.+?)\s+\|\s+создано\s+(.+?)\s+\|\s+итог\s+~(.+)$"#, in: line, group: 0) {
+                rawEngineSizeText = sizes
                 sizeLabel.stringValue = localizedEngineText(sizes)
                 sizeLabel.isHidden = false
             } else if let sizes = capture(#"файл\s+(.+?)\s+->\s+итог\s+~(.+)$"#, in: line, group: 0) {
+                rawEngineSizeText = sizes
                 sizeLabel.stringValue = localizedEngineText(sizes)
                 sizeLabel.isHidden = false
             }
@@ -2176,16 +2216,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if line.hasPrefix("Оценка размера:") {
             statusLabel.stringValue = text("Анализирую размер", "Estimating size")
         } else if line.hasPrefix("Прогноз размера:") {
+            rawEngineSizeText = line
             sizeLabel.stringValue = localizedEngineText(line)
             sizeLabel.isHidden = false
         } else if line.hasPrefix("Пробный VBR:") {
             detailLabel.stringValue = localizedEngineText(line)
         } else if line.hasPrefix("Размеры:") {
-            sizeLabel.stringValue = localizedEngineText(
-                line.replacingOccurrences(of: "Размеры:", with: "").trimmingCharacters(in: .whitespaces)
-            )
+            let rawSize = line.replacingOccurrences(of: "Размеры:", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            rawEngineSizeText = rawSize
+            sizeLabel.stringValue = localizedEngineText(rawSize)
             sizeLabel.isHidden = false
         } else if line.hasPrefix("Итоговый размер:") {
+            rawEngineSizeText = line
             sizeLabel.stringValue = localizedEngineText(line)
             sizeLabel.isHidden = false
         } else if line.hasPrefix("Ошибка:") || isError {
@@ -2198,7 +2241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func updateTechnicalDetails() {
         let rows = [
             ["Профиль", "Исходник"],
-            ["Разрешение", "Видео"],
+            ["Разрешение", "Цвет", "Видео"],
             ["Аудио", "Ускорение", "Режим"]
         ].compactMap { keys -> String? in
             let values = keys.compactMap { key -> String? in
@@ -2208,6 +2251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 case "Профиль": localizedKey = text("Профиль", "Profile")
                 case "Исходник": localizedKey = text("Исходник", "Source")
                 case "Разрешение": localizedKey = text("Разрешение", "Resolution")
+                case "Цвет": localizedKey = text("Цвет", "Color")
                 case "Видео": localizedKey = text("Видео", "Video")
                 case "Аудио": localizedKey = text("Аудио", "Audio")
                 case "Ускорение": localizedKey = text("Ускорение", "Acceleration")
@@ -2227,14 +2271,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let replacements = [
             ("Прогноз размера:", "Estimated size:"), ("Пробный VBR:", "VBR test:"),
             ("Итоговый размер:", "Final size:"), ("Оценка размера:", "Estimating size:"),
+            ("YouTube компактный 4K SDR", "YouTube Compact 4K SDR"),
+            ("CPU (VideoToolbox отключён или недоступен)", "CPU (VideoToolbox disabled or unavailable)"),
+            ("Apple VideoToolbox (аппаратный медиадвижок)", "Apple VideoToolbox (hardware media engine)"),
+            ("не требуется, потоки копируются", "not required, streams are copied"),
+            ("вырезание без повторного кодирования", "cutting without re-encoding"),
+            ("10/12-бит → SDR 8-бит", "10/12-bit → SDR 8-bit"),
+            ("HDR 10-бит, сохранён", "HDR 10-bit, preserved"),
+            ("HDR → SDR 8-бит", "HDR → SDR 8-bit"),
+            ("SDR 8-бит", "SDR 8-bit"),
+            ("без дополнительного сжатия", "without additional compression"),
+            ("Без дополнительного сжатия", "No additional compression"),
+            ("без повторного кодирования", "without re-encoding"),
+            ("Без повторного кодирования", "No re-encoding"),
+            ("без масштабирования", "no scaling"),
+            ("без изменений", "unchanged"),
+            ("нет видеодорожки", "no video track"),
+            ("нет аудиодорожки", "no audio track"),
+            ("неизвестный кодек", "unknown codec"),
+            ("аудио", "audio"),
+            ("копирование потоков", "stream copy"),
+            ("копирование", "copy"),
+            ("кодер CPU", "CPU encoder"),
+            ("роликов", "clips"), ("первый", "first"),
+            ("диапазон", "range"),
+            ("МБ/с", "MB/s"), ("КБ/с", "KB/s"), ("ГБ/с", "GB/s"),
             ("Мбит/с", "Mbps"), ("кбит/с", "kbps"), ("кГц", "kHz"),
             ("КБ", "KB"), ("МБ", "MB"), ("ГБ", "GB"), ("стерео", "stereo"),
-            ("аппаратный медиадвижок", "hardware media engine"),
             ("процессор", "CPU"), ("запись", "write"),
-            ("Без повторного кодирования", "No re-encoding"),
-            ("Без дополнительного сжатия", "No additional compression"),
             ("Сжатие", "Compression"), ("Вырезание", "Cutting"), ("Склейка", "Joining"),
-            ("Исходники", "Sources"), ("исходники", "sources"), ("создано", "created"),
+            ("Исходники", "Sources:"), ("исходники", "sources"), ("создано", "created"),
             ("результат", "result"), ("шт.", "items"),
             ("файл", "file"), ("итог", "result")
         ]

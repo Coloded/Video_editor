@@ -599,7 +599,7 @@ run_join() {
   TMP_FILES+=("$temp_output" "$error_log" "$progress_pipe")
 
   echo "Роликов:       ${#inputs[@]}"
-  echo "Исходник:      роликов ${#inputs[@]}, первый ${first_width}x${first_height}, $first_codec"
+  echo "Исходник:      ${#inputs[@]} роликов, первый ${first_width}x${first_height}, $first_codec"
   echo "Длительность:  $(format_time "$total_duration")"
   echo "Профиль:       $profile_label"
   echo "Разрешение:    ${target_width}x${target_height}, ${target_fps} fps"
