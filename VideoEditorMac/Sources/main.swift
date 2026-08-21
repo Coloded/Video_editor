@@ -484,6 +484,26 @@ private enum EditorTimelineContextTarget {
     case audio(UUID)
 }
 
+private final class DraggableClipTableView: NSTableView {
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard isEnabled, numberOfRows > 0 else { return }
+        for row in 0..<numberOfRows {
+            addCursorRect(rect(ofRow: row), cursor: .openHand)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled, row(at: convert(event.locationInWindow, from: nil)) >= 0 else {
+            super.mouseDown(with: event)
+            return
+        }
+        NSCursor.closedHand.push()
+        defer { NSCursor.pop() }
+        super.mouseDown(with: event)
+    }
+}
+
 private final class EditorTimelineView: NSControl {
     var videos: [EditorVideoTimelineItem] = [] { didSet { needsDisplay = true } }
     var audios: [EditorAudioTimelineItem] = [] { didSet { needsDisplay = true } }
@@ -799,7 +819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let timelineZoomSlider = NSSlider(value: 1, minValue: 1, maxValue: 12, target: nil, action: nil)
     private let timelineZoomLabel = NSTextField(labelWithString: "1×")
     private let selectionLabel = NSTextField(labelWithString: "")
-    private let joinTable = NSTableView()
+    private let joinTable = DraggableClipTableView()
     private let overlayAudioTable = NSTableView()
     private let clipVolumeSlider = NSSlider(value: 1, minValue: 0, maxValue: 2, target: nil, action: nil)
     private let clipVolumeLabel = NSTextField(labelWithString: "100%")
@@ -823,6 +843,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var workspaceRow: NSStackView!
     private var workspaceColumnsConstraint: NSLayoutConstraint!
     private var playerTimeObserver: Any?
+    private var playerBoundaryObserver: Any?
+    private var joinPreviewClipID: UUID?
+    private var isAdvancingJoinPreview = false
+    private var suppressJoinSelectionPreview = false
     private var previewAudioRefreshWorkItem: DispatchWorkItem?
     private var timelineContextTarget: EditorTimelineContextTarget?
     private var timelineContextProjectTime: Double = 0
@@ -1247,6 +1271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinTable.action = #selector(joinSelectionChanged(_:))
         joinTable.registerForDraggedTypes([joinClipPasteboardType])
         joinTable.setDraggingSourceOperationMask(.move, forLocal: true)
+        joinTable.draggingDestinationFeedbackStyle = .gap
 
         let joinScroll = NSScrollView()
         joinScroll.hasVerticalScroller = true
@@ -2259,7 +2284,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             updateJoinAudioControls()
             return
         }
-        guard mode == .join, joinClips.indices.contains(joinTable.selectedRow) else { return }
+        guard !suppressJoinSelectionPreview,
+              mode == .join,
+              joinClips.indices.contains(joinTable.selectedRow) else { return }
         prepareJoinPreview(at: joinTable.selectedRow)
         updateJoinAudioControls()
     }
@@ -3134,12 +3161,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
     }
 
-    private func prepareJoinPreview(at index: Int) {
+    private func prepareJoinPreview(at index: Int, autoplay: Bool = false) {
         guard joinClips.indices.contains(index) else { return }
         let clip = joinClips[index]
         let token = UUID()
         previewToken = token
         removePlayerTimeObserver()
+        joinPreviewClipID = clip.id
+        isAdvancingJoinPreview = false
 
         let player = AVPlayer(playerItem: makeJoinPreviewItem(at: index))
         playerView.player = player
@@ -3161,7 +3190,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             to: CMTime(seconds: clip.lowerValue, preferredTimescale: 600),
             toleranceBefore: .zero,
             toleranceAfter: .zero
-        )
+        ) { [weak self, weak player] finished in
+            guard finished else { return }
+            DispatchQueue.main.async {
+                guard let self, let player,
+                      self.previewToken == token,
+                      self.playerView.player === player else { return }
+                if autoplay {
+                    self.statusLabel.stringValue = self.text("Воспроизведение проекта", "Playing project")
+                    player.play()
+                }
+            }
+        }
         updateEditorPlayhead(for: index, sourceTime: clip.lowerValue)
         playerTimeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.1, preferredTimescale: 600),
@@ -3170,9 +3210,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let self, let player, player.rate > 0 else { return }
             self.updateEditorPlayhead(for: index, sourceTime: time.seconds)
             if time.seconds >= self.timelineView.upperValue {
-                player.pause()
-                player.seek(to: CMTime(seconds: self.timelineView.lowerValue, preferredTimescale: 600))
+                self.advanceJoinPreview(after: index, player: player)
             }
+        }
+        let boundary = CMTime(seconds: clip.upperValue, preferredTimescale: 600)
+        playerBoundaryObserver = player.addBoundaryTimeObserver(
+            forTimes: [NSValue(time: boundary)],
+            queue: .main
+        ) { [weak self, weak player] in
+            guard let self, let player, player.rate > 0 else { return }
+            self.advanceJoinPreview(after: index, player: player)
         }
 
         guard clip.thumbnails.isEmpty else { return }
@@ -3202,6 +3249,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 self.refreshEditorTimeline()
             }
         }
+    }
+
+    private func advanceJoinPreview(after index: Int, player: AVPlayer) {
+        guard !isAdvancingJoinPreview,
+              playerView.player === player,
+              joinClips.indices.contains(index),
+              joinPreviewClipID == joinClips[index].id else { return }
+        isAdvancingJoinPreview = true
+        player.pause()
+
+        let nextIndex = index + 1
+        guard joinClips.indices.contains(nextIndex) else {
+            editorTimelineView.playheadTime = joinClips.reduce(0) {
+                $0 + max(0, $1.upperValue - $1.lowerValue)
+            }
+            statusLabel.stringValue = text("Просмотр проекта завершён", "Project preview finished")
+            isAdvancingJoinPreview = false
+            return
+        }
+
+        suppressJoinSelectionPreview = true
+        joinTable.selectRowIndexes(IndexSet(integer: nextIndex), byExtendingSelection: false)
+        suppressJoinSelectionPreview = false
+        joinTable.scrollRowToVisible(nextIndex)
+        updateJoinAudioControls()
+        refreshEditorTimeline()
+        prepareJoinPreview(at: nextIndex, autoplay: true)
     }
 
     private func makeJoinPreviewItem(at index: Int) -> AVPlayerItem {
@@ -3330,7 +3404,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if let playerTimeObserver, let player = playerView.player {
             player.removeTimeObserver(playerTimeObserver)
         }
+        if let playerBoundaryObserver, let player = playerView.player {
+            player.removeTimeObserver(playerBoundaryObserver)
+        }
         playerTimeObserver = nil
+        playerBoundaryObserver = nil
+        joinPreviewClipID = nil
+        isAdvancingJoinPreview = false
     }
 
     private func timelineChanged(lower: Double, upper: Double, previewTime: Double) {
