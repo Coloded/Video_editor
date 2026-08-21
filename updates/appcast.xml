@@ -3,25 +3,23 @@
     <channel>
         <title>Video_Editor</title>
         <item>
-            <title>3.8</title>
-            <pubDate>Fri, 21 Aug 2026 15:19:50 +0300</pubDate>
+            <title>3.8.1</title>
+            <pubDate>Fri, 21 Aug 2026 15:44:20 +0300</pubDate>
             <link>https://github.com/Coloded/Video_editor</link>
-            <sparkle:version>15</sparkle:version>
-            <sparkle:shortVersionString>3.8</sparkle:shortVersionString>
+            <sparkle:version>16</sparkle:version>
+            <sparkle:shortVersionString>3.8.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# Video Editor 3.8
+            <description sparkle:format="markdown"><![CDATA[# Video Editor 3.8.1
 
-- Новый многодорожечный редактор: видео `V1`, связанный звук `A1`, отделённый и добавленный звук `A2`.
-- Ролики можно обрезать, переставлять и разрезать по правому клику на таймлайне.
-- Добавлены контекстные команды для видео и аудио, регулировка громкости, отключение и удаление дорожек.
-- Звук можно отделить от видео, сохранить отдельно или наложить параллельно с выбором позиции и границ.
-- Предпросмотр воспроизводит итоговый звуковой микс до экспорта.
-- Редактор поддерживает один или несколько роликов и экспорт в HDR 10-бит либо SDR 8-бит.
-- Интерфейс редактора стал широким: параметры слева, большой плеер справа, монтажные дорожки снизу.
-- Исправлены размеры кнопок управления роликами и работа редактора с HDR/10-битными источниками.
+- При добавлении большой группы файлов сразу показываются число выбранных файлов, текущий файл и общий прогресс анализа.
+- Ролики появляются в списке по мере анализа, а звуковые волны достраиваются отдельным этапом.
+- Ролики в списке можно переставлять перетаскиванием мышью.
+- Добавлен масштаб монтажной шкалы от 1× до 12×.
+- Масштаб можно менять кнопками, ползунком или жестом увеличения на трекпаде.
+- При увеличении шкалы доступна горизонтальная прокрутка, поэтому большие проекты больше не сжимаются в мелкие фрагменты.
 ]]></description>
-            <enclosure url="https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg" length="3549856" type="application/octet-stream" sparkle:edSignature="RatU75LlcjvYBXvjWNAryuMBnPJmVPd9LgakZx2YGcOuQKkWfMMQve9Y6R9HGAEy9vRdnvLdTM0cedh9apbhDg=="/>
+            <enclosure url="https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg" length="3564328" type="application/octet-stream" sparkle:edSignature="HZEUmm9NbPKaJLzALvJhV6Q5ZbgVFZ6kvx9VJhl5cDyeEWL9E203259cRHwXLYQMRCRrX2AC5VuEGy6ZTdc9AA=="/>
         </item>
     </channel>
 </rss>

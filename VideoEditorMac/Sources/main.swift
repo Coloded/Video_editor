@@ -497,6 +497,7 @@ private final class EditorTimelineView: NSControl {
     var onChangeAudio: ((UUID, Double, Double, Double) -> Void)?
     var onSeek: ((Double) -> Void)?
     var onContextMenu: ((EditorTimelineContextTarget, Double) -> NSMenu?)?
+    var onMagnify: ((CGFloat) -> Void)?
 
     private let labelWidth: CGFloat = 44
     private let rulerHeight: CGFloat = 25
@@ -699,6 +700,10 @@ private final class EditorTimelineView: NSControl {
         return nil
     }
 
+    override func magnify(with event: NSEvent) {
+        onMagnify?(event.magnification)
+    }
+
     private func begin(_ value: EditorTimelineDrag, _ x: CGFloat, _ start: Double, _ end: Double, _ position: Double) {
         drag = value; dragStartX = x; initialStart = start; initialEnd = end; initialPosition = position
     }
@@ -790,6 +795,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let timelineView = RangeTimelineView()
     private let audioTimelineView = AudioTimelineView()
     private let editorTimelineView = EditorTimelineView()
+    private let editorTimelineScroll = NSScrollView()
+    private let timelineZoomSlider = NSSlider(value: 1, minValue: 1, maxValue: 12, target: nil, action: nil)
+    private let timelineZoomLabel = NSTextField(labelWithString: "1×")
     private let selectionLabel = NSTextField(labelWithString: "")
     private let joinTable = NSTableView()
     private let overlayAudioTable = NSTableView()
@@ -805,6 +813,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var joinStack: NSStackView!
     private var joinClips: [JoinClip] = []
     private var overlayAudioTracks: [OverlayAudio] = []
+    private var isPreparingJoinClips = false
+    private var pendingJoinFileCount = 0
+    private var pendingJoinURLs: [URL] = []
     private var joinEditButtons: [NSButton] = []
     private var profileRow: NSStackView!
     private var cutRow: NSStackView!
@@ -815,6 +826,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var previewAudioRefreshWorkItem: DispatchWorkItem?
     private var timelineContextTarget: EditorTimelineContextTarget?
     private var timelineContextProjectTime: Double = 0
+    private let joinClipPasteboardType = NSPasteboard.PasteboardType("ru.coloded.videoeditor.join-clip")
 
     private let statusLabel = NSTextField(labelWithString: "")
     private let percentLabel = NSTextField(labelWithString: "0%")
@@ -1010,7 +1022,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             ("Сохранить звук…", "Save audio…"), ("Отделить звук", "Detach audio"),
             ("Параллельный звук", "Parallel audio"),
             ("Добавить звук…", "Add audio…"), ("Удалить звук", "Remove audio"),
-            ("Позиция", "Position"), ("Громкость", "Volume"),
+            ("Позиция", "Position"), ("Громкость", "Volume"), ("Масштаб", "Zoom"),
+            ("Прокрутка: трекпад или Shift + колёсико", "Scroll: trackpad or Shift + mouse wheel"),
+            ("Уменьшить масштаб таймлайна", "Zoom timeline out"),
+            ("Увеличить масштаб таймлайна", "Zoom timeline in"),
             ("Сохраняю звуковую дорожку", "Saving audio track"),
             ("Звуковая дорожка сохранена", "Audio track saved")
         ]
@@ -1230,6 +1245,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinTable.dataSource = self
         joinTable.delegate = self
         joinTable.action = #selector(joinSelectionChanged(_:))
+        joinTable.registerForDraggedTypes([joinClipPasteboardType])
+        joinTable.setDraggingSourceOperationMask(.move, forLocal: true)
 
         let joinScroll = NSScrollView()
         joinScroll.hasVerticalScroller = true
@@ -1393,7 +1410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         audioTimelineView.onChange = { [weak self] position, sourceStart, sourceEnd in
             self?.audioTimelineChanged(position: position, sourceStart: sourceStart, sourceEnd: sourceEnd)
         }
-        editorTimelineView.heightAnchor.constraint(equalToConstant: 223).isActive = true
+        editorTimelineView.frame = NSRect(x: 0, y: 0, width: 1200, height: 223)
         editorTimelineView.onSelectVideo = { [weak self] index in self?.selectVideoFromEditorTimeline(index) }
         editorTimelineView.onSelectAudio = { [weak self] id in self?.selectAudioFromEditorTimeline(id) }
         editorTimelineView.onTrimVideo = { [weak self] index, start, end in self?.trimVideoFromEditorTimeline(index: index, start: start, end: end) }
@@ -1403,6 +1420,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         editorTimelineView.onContextMenu = { [weak self] target, projectTime in
             self?.editorContextMenu(for: target, projectTime: projectTime)
         }
+        editorTimelineView.onMagnify = { [weak self] amount in
+            self?.changeTimelineZoom(by: Double(amount) * 3)
+        }
+
+        editorTimelineScroll.documentView = editorTimelineView
+        editorTimelineScroll.hasHorizontalScroller = true
+        editorTimelineScroll.hasVerticalScroller = false
+        editorTimelineScroll.autohidesScrollers = false
+        editorTimelineScroll.drawsBackground = false
+        editorTimelineScroll.borderType = .noBorder
+        editorTimelineScroll.horizontalScrollElasticity = .automatic
+        editorTimelineScroll.heightAnchor.constraint(equalToConstant: 239).isActive = true
+
+        let zoomOutButton = makeIconButton(
+            symbol: "minus.magnifyingglass",
+            toolTip: text("Уменьшить масштаб таймлайна", "Zoom timeline out"),
+            action: #selector(zoomTimelineOut(_:))
+        )
+        let zoomInButton = makeIconButton(
+            symbol: "plus.magnifyingglass",
+            toolTip: text("Увеличить масштаб таймлайна", "Zoom timeline in"),
+            action: #selector(zoomTimelineIn(_:))
+        )
+        timelineZoomSlider.target = self
+        timelineZoomSlider.action = #selector(timelineZoomChanged(_:))
+        timelineZoomSlider.isContinuous = true
+        timelineZoomSlider.widthAnchor.constraint(equalToConstant: 190).isActive = true
+        timelineZoomLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        timelineZoomLabel.alignment = .right
+        timelineZoomLabel.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        let zoomSpacer = NSView()
+        zoomSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let zoomHint = NSTextField(labelWithString: text(
+            "Прокрутка: трекпад или Shift + колёсико",
+            "Scroll: trackpad or Shift + mouse wheel"
+        ))
+        zoomHint.textColor = .secondaryLabelColor
+        let zoomRow = NSStackView(views: [
+            NSTextField(labelWithString: text("Масштаб", "Zoom")),
+            zoomOutButton, timelineZoomSlider, zoomInButton, timelineZoomLabel,
+            zoomSpacer, zoomHint
+        ])
+        zoomRow.orientation = .horizontal
+        zoomRow.alignment = .centerY
+        zoomRow.spacing = 7
 
         selectionLabel.textColor = .secondaryLabelColor
         selectionLabel.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .regular)
@@ -1422,14 +1484,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         workspaceColumnsConstraint.isActive = false
         playerView.isHidden = true
 
-        previewStack = NSStackView(views: [editorTimelineView, selectionLabel])
+        previewStack = NSStackView(views: [zoomRow, editorTimelineScroll, selectionLabel])
         previewStack.orientation = .vertical
         previewStack.alignment = .leading
         previewStack.spacing = 8
         previewStack.isHidden = true
-        for view in [editorTimelineView, selectionLabel] {
+        for view in [zoomRow, editorTimelineScroll, selectionLabel] {
             view.widthAnchor.constraint(equalTo: previewStack.widthAnchor).isActive = true
         }
+        DispatchQueue.main.async { [weak self] in self?.updateEditorTimelineWidth() }
 
         let separator = NSBox()
         separator.boxType = .separator
@@ -1570,7 +1633,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         if let input = ProcessInfo.processInfo.environment["VIDEO_EDITOR_SNAPSHOT_INPUT"] {
             let url = URL(fileURLWithPath: input)
             if snapshotMode == "join" || snapshotMode == "cut" {
-                addJoinURLs([url, url, url])
+                let count = Int(ProcessInfo.processInfo.environment["VIDEO_EDITOR_SNAPSHOT_COUNT"] ?? "3") ?? 3
+                addJoinURLs(Array(repeating: url, count: max(1, count)))
             } else {
                 selectInput(url)
             }
@@ -1869,6 +1933,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
         window.setFrame(frame, display: true, animate: animated)
+        DispatchQueue.main.async { [weak self] in self?.updateEditorTimelineWidth() }
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        updateEditorTimelineWidth()
+    }
+
+    @objc private func timelineZoomChanged(_ sender: NSSlider) {
+        updateEditorTimelineWidth()
+    }
+
+    @objc private func zoomTimelineOut(_ sender: Any?) {
+        changeTimelineZoom(by: -0.5)
+    }
+
+    @objc private func zoomTimelineIn(_ sender: Any?) {
+        changeTimelineZoom(by: 0.5)
+    }
+
+    private func changeTimelineZoom(by delta: Double) {
+        timelineZoomSlider.doubleValue = min(
+            timelineZoomSlider.maxValue,
+            max(timelineZoomSlider.minValue, timelineZoomSlider.doubleValue + delta)
+        )
+        updateEditorTimelineWidth()
+    }
+
+    private func updateEditorTimelineWidth() {
+        let viewportWidth = editorTimelineScroll.contentView.bounds.width
+        guard viewportWidth > 20 else { return }
+        let oldWidth = max(viewportWidth, editorTimelineView.frame.width)
+        let visibleCenter = editorTimelineScroll.contentView.bounds.midX
+        let centerFraction = min(1, max(0, visibleCenter / oldWidth))
+        let zoom = timelineZoomSlider.doubleValue
+        let newWidth = max(viewportWidth, viewportWidth * CGFloat(zoom))
+        editorTimelineView.frame = NSRect(x: 0, y: 0, width: newWidth, height: 223)
+        editorTimelineLabel(for: zoom)
+        let targetX = min(
+            max(0, centerFraction * newWidth - viewportWidth / 2),
+            max(0, newWidth - viewportWidth)
+        )
+        editorTimelineScroll.contentView.scroll(to: NSPoint(x: targetX, y: 0))
+        editorTimelineScroll.reflectScrolledClipView(editorTimelineScroll.contentView)
+        editorTimelineView.needsDisplay = true
+    }
+
+    private func editorTimelineLabel(for zoom: Double) {
+        if abs(zoom.rounded() - zoom) < 0.01 {
+            timelineZoomLabel.stringValue = "\(Int(zoom.rounded()))×"
+        } else {
+            timelineZoomLabel.stringValue = String(format: "%.1f×", zoom)
+        }
     }
 
     private func row(withIdentifier identifier: String) -> NSView? {
@@ -1884,6 +2000,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc private func openFile(_ sender: Any?) {
         guard process?.isRunning != true else {
             NSSound.beep()
+            return
+        }
+        guard mode != .join || !isPreparingJoinClips else {
+            NSSound.beep()
+            statusLabel.stringValue = text("Подготовка выбранных файлов ещё продолжается", "The selected files are still being prepared")
             return
         }
 
@@ -1912,54 +2033,139 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func addJoinURLs(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
-        statusLabel.stringValue = text("Анализирую ролики", "Analyzing clips")
-        detailLabel.stringValue = text("Добавляется: \(urls.count)", "Adding: \(urls.count)")
+        guard !urls.isEmpty, !isPreparingJoinClips else { return }
+        isPreparingJoinClips = true
+        pendingJoinFileCount = urls.count
+        pendingJoinURLs = urls
+        modeControl.isEnabled = false
+        browseButton.isEnabled = false
+        joinEditButtons.first?.isEnabled = false
+        statusLabel.stringValue = text("Выбрано файлов: \(urls.count)", "Selected files: \(urls.count)")
+        detailLabel.stringValue = text("Начинаю подготовку…", "Starting preparation…")
+        progressBar.doubleValue = 0
+        percentLabel.stringValue = "0%"
         startButton.isEnabled = false
+        updateJoinFileSummary()
         let token = UUID()
         analysisToken = token
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let clips = urls.compactMap { url -> JoinClip? in
-                guard let info = self.probeSource(url), info.duration > 0 else { return nil }
-                return JoinClip(
-                    id: UUID(),
-                    url: url,
-                    info: info,
-                    lowerValue: 0,
-                    upperValue: info.duration,
-                    thumbnails: [],
-                    volume: 1,
-                    waveform: info.hasAudio ? self.generateAudioWaveform(url) : []
-                )
+            var audioWork: [(UUID, URL)] = []
+            var addedCount = 0
+            for (offset, url) in urls.enumerated() {
+                DispatchQueue.main.async {
+                    guard self.analysisToken == token, self.mode == .join else { return }
+                    self.statusLabel.stringValue = self.text(
+                        "Анализирую файл \(offset + 1) из \(urls.count)",
+                        "Analyzing file \(offset + 1) of \(urls.count)"
+                    )
+                    self.detailLabel.stringValue = url.lastPathComponent
+                }
+                let info = self.probeSource(url)
+                let clip: JoinClip?
+                if let info, info.duration > 0 {
+                    clip = JoinClip(
+                        id: UUID(), url: url, info: info,
+                        lowerValue: 0, upperValue: info.duration,
+                        thumbnails: [], volume: 1, waveform: []
+                    )
+                    if let clip, info.hasAudio { audioWork.append((clip.id, url)) }
+                    addedCount += 1
+                } else {
+                    clip = nil
+                }
+                DispatchQueue.main.async {
+                    guard self.analysisToken == token, self.mode == .join else { return }
+                    self.pendingJoinFileCount = max(0, self.pendingJoinFileCount - 1)
+                    if let pendingIndex = self.pendingJoinURLs.firstIndex(of: url) {
+                        self.pendingJoinURLs.remove(at: pendingIndex)
+                    }
+                    if let clip {
+                        let newRow = self.joinClips.count
+                        self.joinClips.append(clip)
+                        self.joinTable.reloadData()
+                        if self.joinTable.selectedRow < 0 {
+                            self.joinTable.selectRowIndexes(IndexSet(integer: newRow), byExtendingSelection: false)
+                            self.prepareJoinPreview(at: newRow)
+                        }
+                    }
+                    self.progressBar.doubleValue = Double(offset + 1) / Double(urls.count) * 40
+                    self.percentLabel.stringValue = "\(Int(self.progressBar.doubleValue.rounded()))%"
+                    self.updateJoinFileSummary()
+                }
+            }
+
+            for (offset, work) in audioWork.enumerated() {
+                DispatchQueue.main.async {
+                    guard self.analysisToken == token, self.mode == .join else { return }
+                    self.statusLabel.stringValue = self.text(
+                        "Строю звуковую волну \(offset + 1) из \(audioWork.count)",
+                        "Building waveform \(offset + 1) of \(audioWork.count)"
+                    )
+                    self.detailLabel.stringValue = work.1.lastPathComponent
+                }
+                let waveform = self.generateAudioWaveform(work.1)
+                DispatchQueue.main.async {
+                    guard self.analysisToken == token, self.mode == .join,
+                          let index = self.joinClips.firstIndex(where: { $0.id == work.0 }) else { return }
+                    self.joinClips[index].waveform = waveform
+                    let waveformProgress = audioWork.isEmpty
+                        ? 1 : Double(offset + 1) / Double(audioWork.count)
+                    self.progressBar.doubleValue = 40 + waveformProgress * 60
+                    self.percentLabel.stringValue = "\(Int(self.progressBar.doubleValue.rounded()))%"
+                    self.refreshEditorTimeline()
+                }
             }
             DispatchQueue.main.async {
-                guard self.analysisToken == token, self.mode == .join else { return }
-                let firstNewRow = self.joinClips.count
-                self.joinClips.append(contentsOf: clips)
-                self.joinTable.reloadData()
-                self.updateJoinFileSummary()
-                guard !clips.isEmpty else {
-                    self.statusLabel.stringValue = self.text("Видео не найдено", "No video found")
-                    self.detailLabel.stringValue = self.text("Выбранные файлы не содержат видеодорожку", "The selected files do not contain a video track")
-                    self.updateStartButtonAvailability()
-                    return
-                }
-                self.joinTable.selectRowIndexes(IndexSet(integer: firstNewRow), byExtendingSelection: false)
-                self.prepareJoinPreview(at: firstNewRow)
+                self.finishJoinFilePreparation(token: token, addedCount: addedCount, requestedCount: urls.count)
             }
         }
     }
 
+    private func finishJoinFilePreparation(token: UUID, addedCount: Int, requestedCount: Int) {
+        guard analysisToken == token, mode == .join else { return }
+        isPreparingJoinClips = false
+        pendingJoinFileCount = 0
+        pendingJoinURLs = []
+        modeControl.isEnabled = process?.isRunning != true
+        browseButton.isEnabled = process?.isRunning != true
+        joinEditButtons.first?.isEnabled = process?.isRunning != true
+        progressBar.doubleValue = 100
+        percentLabel.stringValue = "100%"
+        if addedCount > 0 {
+            statusLabel.stringValue = text("Файлы готовы к редактированию", "Files are ready to edit")
+            detailLabel.stringValue = text(
+                "Добавлено \(addedCount) из \(requestedCount)",
+                "Added \(addedCount) of \(requestedCount)"
+            )
+        } else {
+            statusLabel.stringValue = text("Видео не найдено", "No video found")
+            detailLabel.stringValue = text(
+                "Выбранные файлы не содержат видеодорожку",
+                "The selected files do not contain a video track"
+            )
+        }
+        updateJoinFileSummary()
+    }
+
     private func updateJoinFileSummary() {
-        if joinClips.isEmpty {
+        let selectedCount = joinClips.count + pendingJoinFileCount
+        if selectedCount == 0 {
             fileField.stringValue = text("Ролики не выбраны", "No clips selected")
             fileField.toolTip = nil
             selectedInputURL = nil
         } else {
-            fileField.stringValue = text("Выбрано роликов: \(joinClips.count)", "Selected clips: \(joinClips.count)")
-            fileField.toolTip = joinClips.map { $0.url.lastPathComponent }.joined(separator: "\n")
+            if pendingJoinFileCount > 0 {
+                fileField.stringValue = text(
+                    "Выбрано файлов: \(selectedCount), подготовка: \(pendingJoinFileCount)",
+                    "Selected files: \(selectedCount), preparing: \(pendingJoinFileCount)"
+                )
+            } else {
+                fileField.stringValue = text("Выбрано роликов: \(joinClips.count)", "Selected clips: \(joinClips.count)")
+            }
+            fileField.toolTip = (joinClips.map(\.url) + pendingJoinURLs)
+                .map { $0.lastPathComponent }.joined(separator: "\n")
             selectedInputURL = joinClips.first?.url
             window.representedURL = joinClips.first?.url
         }
@@ -2002,6 +2208,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         field.stringValue = "\(row + 1).  \(clip.url.lastPathComponent)    \(formatEditorTime(clip.lowerValue))–\(formatEditorTime(clip.upperValue))    \(Int((clip.volume * 100).rounded()))%"
         field.toolTip = clip.url.path
         return field
+    }
+
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard tableView === joinTable, joinClips.indices.contains(row), process?.isRunning != true else { return nil }
+        let item = NSPasteboardItem()
+        item.setString(joinClips[row].id.uuidString, forType: joinClipPasteboardType)
+        return item
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        validateDrop info: NSDraggingInfo,
+        proposedRow row: Int,
+        proposedDropOperation dropOperation: NSTableView.DropOperation
+    ) -> NSDragOperation {
+        guard tableView === joinTable,
+              process?.isRunning != true,
+              info.draggingPasteboard.string(forType: joinClipPasteboardType) != nil else { return [] }
+        tableView.setDropRow(row, dropOperation: .above)
+        return .move
+    }
+
+    func tableView(
+        _ tableView: NSTableView,
+        acceptDrop info: NSDraggingInfo,
+        row: Int,
+        dropOperation: NSTableView.DropOperation
+    ) -> Bool {
+        guard tableView === joinTable,
+              let rawID = info.draggingPasteboard.string(forType: joinClipPasteboardType),
+              let id = UUID(uuidString: rawID),
+              let source = joinClips.firstIndex(where: { $0.id == id }) else { return false }
+        let clip = joinClips.remove(at: source)
+        var destination = row
+        if source < destination { destination -= 1 }
+        destination = min(max(0, destination), joinClips.count)
+        joinClips.insert(clip, at: destination)
+        joinTable.reloadData()
+        joinTable.selectRowIndexes(IndexSet(integer: destination), byExtendingSelection: false)
+        updateJoinFileSummary()
+        prepareJoinPreview(at: destination)
+        refreshEditorTimeline()
+        scheduleJoinPreviewAudioRefresh(immediately: true)
+        return true
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -3787,7 +4037,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             startButton.isEnabled = timelineView.isEnabled && timelineView.upperValue > timelineView.lowerValue
         case .join:
-            startButton.isEnabled = !joinClips.isEmpty && joinClips.allSatisfy { $0.upperValue > $0.lowerValue }
+            startButton.isEnabled = !isPreparingJoinClips && !joinClips.isEmpty && joinClips.allSatisfy { $0.upperValue > $0.lowerValue }
         }
     }
 
