@@ -315,6 +315,7 @@ print_progress() {
   local speed="${5:---}"
   local current_size="${6:-}"
   local predicted_size="${7:-}"
+  local source_summary="${8:-}"
   local elapsed percent eta now spinner bar bar_width filled index
   local size_text=""
 
@@ -353,7 +354,11 @@ print_progress() {
   speed="${speed//[[:space:]]/}"
   [[ -z "$speed" || "$speed" == "N/A" ]] && speed="--"
   if [[ -n "$current_size" && -n "$predicted_size" ]]; then
-    size_text=" | файл $current_size -> итог ~$predicted_size"
+    if [[ -n "$source_summary" ]]; then
+      size_text=" | Исходники $source_summary | создано $current_size | итог ~$predicted_size"
+    else
+      size_text=" | файл $current_size -> итог ~$predicted_size"
+    fi
   fi
   if [[ "$PLAIN_PROGRESS" == "1" ]]; then
     printf "%s [%s] %3d%% | %s %s/%s | прошло %s | осталось %s | %s%s\n" \
@@ -375,11 +380,15 @@ run_join() {
   [[ -f "$manifest" ]] || die "манифест не найден: $MANIFEST_RAW"
 
   local -a inputs starts ends durations has_audio input_args
-  local clip_path start_raw end_raw start end duration clip_duration
+  local clip_path start_raw end_raw start end duration clip_duration clip_bytes
   local clip_codec clip_pixel_format clip_color_transfer
+  local source_total_bytes=0
   while IFS=$'\t' read -r clip_path start_raw end_raw; do
     [[ -n "$clip_path" ]] || continue
     [[ -f "$clip_path" ]] || die "ролик не найден: $clip_path"
+    clip_bytes="$(stat -f "%z" "$clip_path" 2>/dev/null || true)"
+    [[ "$clip_bytes" =~ '^[0-9]+$' ]] || die "не удалось определить размер ролика: $clip_path"
+    source_total_bytes=$((source_total_bytes + clip_bytes))
     clip_codec="$(stream_value "$clip_path" "v:0" "codec_name")"
     [[ -n "$clip_codec" ]] || die "в файле нет видеодорожки: $clip_path"
     clip_pixel_format="$(stream_value "$clip_path" "v:0" "pix_fmt")"
@@ -414,6 +423,7 @@ run_join() {
   done < "$manifest"
 
   (( ${#inputs[@]} >= 2 )) || die "для склейки нужно минимум два ролика"
+  local source_summary="${#inputs[@]} шт., $(format_file_size "$source_total_bytes")"
 
   local first="${inputs[1]}"
   local first_width first_height first_fps_raw first_codec target_width target_height target_fps
@@ -718,7 +728,7 @@ run_join() {
           printf "\r\033[1A\033[2K\rРесурсы: %s\n" "$resource_text"
         fi
         print_progress "$started" "$total_duration" "$position" "Склейка" \
-          "$current_speed" "$current_size_text" "$predicted_size_text"
+          "$current_speed" "$current_size_text" "$predicted_size_text" "$source_summary"
         ;;
     esac
   done < "$progress_pipe"
@@ -740,7 +750,9 @@ run_join() {
   echo "Готово: $output"
   local final_bytes
   final_bytes="$(stat -f "%z" "$output" 2>/dev/null || true)"
-  [[ -n "$final_bytes" ]] && echo "Итоговый размер: $(format_file_size "$final_bytes")"
+  if [[ -n "$final_bytes" ]]; then
+    echo "Размеры: Исходники $source_summary | результат $(format_file_size "$final_bytes")"
+  fi
 }
 
 if (( $# > 0 )); then

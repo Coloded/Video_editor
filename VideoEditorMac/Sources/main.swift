@@ -939,7 +939,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 let cores = ProcessInfo.processInfo.activeProcessorCount
                 let ram = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
                 self.processLine("Ресурсы: CPU 62% (6.2/\(cores)) | RAM 420.0 МБ / \(String(format: "%.0f", ram)) ГБ | Media Engine VT | запись 7.1 МБ/с", isError: false)
-                self.processLine("/ [##########--------------] 42% | Видео 00:05:41.000/00:13:32.020 | прошло 00:00:36.000 | осталось 00:00:50.000 | 9.47x | файл 272.0 МБ -> итог ~647.8 МБ", isError: false)
+                if self.mode == .join {
+                    self.processLine("/ [##########--------------] 42% | Склейка 00:05:41.000/00:13:32.020 | прошло 00:00:36.000 | осталось 00:00:50.000 | 9.47x | Исходники 21 шт., 3.821 ГБ | создано 272.0 МБ | итог ~647.8 МБ", isError: false)
+                } else {
+                    self.processLine("/ [##########--------------] 42% | Видео 00:05:41.000/00:13:32.020 | прошло 00:00:36.000 | осталось 00:00:50.000 | 9.47x | файл 272.0 МБ -> итог ~647.8 МБ", isError: false)
+                }
             }
             view.layoutSubtreeIfNeeded()
             let bounds = view.bounds
@@ -2141,7 +2145,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             detailLabel.stringValue = details.joined(separator: "   •   ")
 
-            if let sizes = capture(#"файл\s+(.+?)\s+->\s+итог\s+~(.+)$"#, in: line, group: 0) {
+            if let sizes = capture(#"Исходники\s+(.+?)\s+\|\s+создано\s+(.+?)\s+\|\s+итог\s+~(.+)$"#, in: line, group: 0) {
+                sizeLabel.stringValue = localizedEngineText(sizes)
+                sizeLabel.isHidden = false
+            } else if let sizes = capture(#"файл\s+(.+?)\s+->\s+итог\s+~(.+)$"#, in: line, group: 0) {
                 sizeLabel.stringValue = localizedEngineText(sizes)
                 sizeLabel.isHidden = false
             }
@@ -2155,6 +2162,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             sizeLabel.isHidden = false
         } else if line.hasPrefix("Пробный VBR:") {
             detailLabel.stringValue = localizedEngineText(line)
+        } else if line.hasPrefix("Размеры:") {
+            sizeLabel.stringValue = localizedEngineText(
+                line.replacingOccurrences(of: "Размеры:", with: "").trimmingCharacters(in: .whitespaces)
+            )
+            sizeLabel.isHidden = false
         } else if line.hasPrefix("Итоговый размер:") {
             sizeLabel.stringValue = localizedEngineText(line)
             sizeLabel.isHidden = false
@@ -2198,12 +2210,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             ("Прогноз размера:", "Estimated size:"), ("Пробный VBR:", "VBR test:"),
             ("Итоговый размер:", "Final size:"), ("Оценка размера:", "Estimating size:"),
             ("Мбит/с", "Mbps"), ("кбит/с", "kbps"), ("кГц", "kHz"),
-            ("МБ", "MB"), ("ГБ", "GB"), ("стерео", "stereo"),
+            ("КБ", "KB"), ("МБ", "MB"), ("ГБ", "GB"), ("стерео", "stereo"),
             ("аппаратный медиадвижок", "hardware media engine"),
             ("процессор", "CPU"), ("запись", "write"),
             ("Без повторного кодирования", "No re-encoding"),
             ("Без дополнительного сжатия", "No additional compression"),
             ("Сжатие", "Compression"), ("Вырезание", "Cutting"), ("Склейка", "Joining"),
+            ("Исходники", "Sources"), ("исходники", "sources"), ("создано", "created"),
+            ("результат", "result"), ("шт.", "items"),
             ("файл", "file"), ("итог", "result")
         ]
         return replacements.reduce(source) { result, replacement in
