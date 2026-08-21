@@ -7,6 +7,7 @@ SOURCE="$ROOT/Sources/main.swift"
 PLIST="$ROOT/Info.plist"
 ENGINE="$ROOT/Resources/video_engine"
 ICON="$ROOT/Resources/AppIcon-master.png"
+SPARKLE_FETCH="$ROOT/fetch_sparkle.sh"
 INSTALL_DIR="/Applications"
 APP="$INSTALL_DIR/Video_Editor.app"
 LEGACY_APP="$INSTALL_DIR/Video Editor.app"
@@ -46,6 +47,7 @@ usage() {
 
 Если не установлены Apple Command Line Tools или FFmpeg, скрипт объяснит,
 чего не хватает, и в интерактивном Terminal предложит начать установку.
+
 EOF
 }
 
@@ -159,11 +161,10 @@ check_input_file "$SOURCE" "исходный файл Swift"
 check_input_file "$PLIST" "Info.plist"
 check_input_file "$ENGINE" "внутренний video_engine"
 check_input_file "$ICON" "исходную иконку"
+check_input_file "$SPARKLE_FETCH" "скрипт загрузки Sparkle"
 [[ -d "$WORKSPACE" ]] || die "не найдена папка проекта: $WORKSPACE"
 [[ -w "$WORKSPACE" ]] || die "нет прав на запись в папку проекта: $WORKSPACE"
 [[ -d "$INSTALL_DIR" ]] || die "не найдена системная папка приложений: $INSTALL_DIR"
-[[ -w "$INSTALL_DIR" ]] || \
-  die "нет прав на запись в $INSTALL_DIR. Запустите сборку из учётной записи администратора или установите готовый DMG вручную"
 
 command -v xcrun >/dev/null 2>&1 || request_command_line_tools
 
@@ -172,6 +173,8 @@ for specification in \
   "plutil:системная утилита проверки plist отсутствует" \
   "codesign:системная утилита подписи отсутствует" \
   "hdiutil:системная утилита создания DMG отсутствует" \
+  "ditto:системная утилита копирования bundle отсутствует" \
+  "otool:установите или обновите Apple Command Line Tools" \
   "lipo:установите или обновите Apple Command Line Tools" \
   "perl:системный Perl необходим для создания icns" \
   "stat:системная команда stat отсутствует" \
@@ -238,16 +241,27 @@ if [[ "$AVAILABLE_KB" =~ '^[0-9]+$' ]] && (( AVAILABLE_KB < 102400 )); then
 fi
 
 check_runtime_tools
+SPARKLE_ROOT="$($SPARKLE_FETCH)" || die "не удалось подготовить Sparkle для автообновлений"
+SPARKLE_FRAMEWORK="$SPARKLE_ROOT/Sparkle.framework"
+[[ -d "$SPARKLE_FRAMEWORK" ]] || die "не найден Sparkle.framework: $SPARKLE_FRAMEWORK"
+[[ -f "$SPARKLE_ROOT/LICENSE" ]] || die "не найдена лицензия Sparkle: $SPARKLE_ROOT/LICENSE"
+SPARKLE_ARCHS="$(lipo -archs "$SPARKLE_FRAMEWORK/Versions/Current/Sparkle" 2>/dev/null || true)"
+[[ " $SPARKLE_ARCHS " == *" arm64 "* ]] || \
+  die "Sparkle.framework не содержит arm64; найдено: '${SPARKLE_ARCHS:-неизвестно}'"
+success "Sparkle 2.9.6 готов для безопасных автообновлений"
 if [[ "$CHECK_ONLY" == "1" ]]; then
   success "Все обязательные проверки пройдены. Сборку можно запускать."
   exit 0
 fi
+[[ -w "$INSTALL_DIR" ]] || \
+  die "нет прав на запись в $INSTALL_DIR. Запустите сборку из учётной записи администратора или установите готовый DMG вручную"
 
 if ! STAGING="$(mktemp -d -t video-editor-app.XXXXXX)" || [[ ! -d "$STAGING" ]]; then
   die "не удалось создать временную папку для сборки"
 fi
 STAGED_APP="$STAGING/Video_Editor.app"
-mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources" || \
+mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources" \
+  "$STAGED_APP/Contents/Frameworks" || \
   die "не удалось создать структуру приложения во временной папке"
 
 info "Компилирую Swift под Apple Silicon (arm64)"
@@ -261,6 +275,10 @@ if ! MACOSX_DEPLOYMENT_TARGET=11.0 xcrun swiftc \
   -framework AVFoundation \
   -framework AVKit \
   -framework UniformTypeIdentifiers \
+  -F "$SPARKLE_ROOT" \
+  -framework Sparkle \
+  -Xlinker -rpath \
+  -Xlinker @executable_path/../Frameworks \
   "$SOURCE" \
   -o "$STAGED_APP/Contents/MacOS/VideoEditor"; then
   die "Swift compiler не смог собрать приложение; исправьте ошибки, показанные выше"
@@ -268,6 +286,10 @@ fi
 
 cp "$PLIST" "$STAGED_APP/Contents/Info.plist" || die "не удалось скопировать Info.plist"
 cp "$ENGINE" "$STAGED_APP/Contents/Resources/video_engine" || die "не удалось добавить video_engine"
+ditto "$SPARKLE_FRAMEWORK" "$STAGED_APP/Contents/Frameworks/Sparkle.framework" || \
+  die "не удалось встроить Sparkle.framework"
+cp "$SPARKLE_ROOT/LICENSE" "$STAGED_APP/Contents/Resources/Sparkle-LICENSE.txt" || \
+  die "не удалось добавить лицензию Sparkle"
 
 info "Создаю AppIcon.icns"
 ICONSET="$STAGING/AppIcon.iconset"
@@ -330,8 +352,14 @@ ARCHS="$(lipo -archs "$STAGED_APP/Contents/MacOS/VideoEditor" 2>/dev/null)" || \
 [[ " $ARCHS " == *" arm64 "* ]] || die "собран неверный бинарник: ожидалась arm64, получено '$ARCHS'"
 file "$STAGED_APP/Contents/MacOS/VideoEditor" | grep -q 'arm64' || \
   die "команда file не подтверждает архитектуру arm64"
+otool -L "$STAGED_APP/Contents/MacOS/VideoEditor" | \
+  grep -q '@rpath/Sparkle.framework/Versions/B/Sparkle' || \
+  die "основной бинарник не связан со Sparkle.framework"
 
-codesign --force --deep --sign - "$STAGED_APP" >/dev/null || die "не удалось подписать приложение ad-hoc подписью"
+codesign --force --deep --sign - "$STAGED_APP" >/dev/null || \
+  die "не удалось подписать приложение ad-hoc подписью"
+codesign --verify --deep --strict --verbose=2 "$STAGED_APP/Contents/Frameworks/Sparkle.framework" || \
+  die "проверка подписи Sparkle.framework завершилась ошибкой"
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP" || die "проверка подписи приложения завершилась ошибкой"
 
 info "Создаю установочный DMG"
@@ -381,8 +409,13 @@ if [[ -n "$PREVIOUS_LEGACY_APP" && -e "$PREVIOUS_LEGACY_APP" ]]; then
   rm -rf -- "$PREVIOUS_LEGACY_APP"
 fi
 mv -f "$DMG_TEMP" "$DMG" || die "не удалось сохранить готовый DMG: $DMG"
+STABLE_DMG="$DIST/Video_Editor-stable.dmg"
+ditto "$DMG" "$STABLE_DMG" || die "не удалось создать stable-DMG: $STABLE_DMG"
+hdiutil verify "$STABLE_DMG" >/dev/null || die "stable-DMG не прошёл проверку целостности"
 
 success "Приложение собрано и установлено"
 print -r -- "$APP"
 success "Установочный образ создан"
 print -r -- "$DMG"
+success "Постоянный образ для автообновлений создан"
+print -r -- "$STABLE_DMG"

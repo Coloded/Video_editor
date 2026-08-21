@@ -1,0 +1,45 @@
+name: Publish stable release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-15
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Validate version and release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(plutil -extract CFBundleShortVersionString raw VideoEditorMac/Info.plist)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$tag_version" = "$version"
+          test -s "dist/Video-Editor-${version}-arm64.dmg"
+          test -s "dist/Video_Editor-stable.dmg"
+          test -s "updates/appcast.xml"
+          hdiutil verify "dist/Video-Editor-${version}-arm64.dmg"
+          hdiutil verify "dist/Video_Editor-stable.dmg"
+          grep -Fq "Video_Editor-stable.dmg" updates/appcast.xml
+          grep -Fq "sparkle:edSignature=" updates/appcast.xml
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(plutil -extract CFBundleShortVersionString raw VideoEditorMac/Info.plist)"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/Video-Editor-${version}-arm64.dmg" \
+            "dist/Video_Editor-stable.dmg" \
+            --title "Video Editor ${version}" \
+            --notes-file updates/release-notes.md \
+            --latest

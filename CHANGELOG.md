@@ -8,6 +8,25 @@
 
 Изменения для следующей версии пока не опубликованы.
 
+## [3.7] — 2026-08-21
+
+### Добавлено
+
+- Безопасное самообновление приложения через Sparkle 2.9.6.
+- Команда **Проверить обновления… / Check for Updates…** в меню приложения.
+- Периодическая автоматическая проверка новой стабильной версии с подтверждением пользователя перед установкой.
+- Подписанный EdDSA-файл `updates/appcast.xml`; приватный ключ хранится только в локальной Связке ключей macOS и не публикуется.
+- Постоянный выпускной образ `Video_Editor-stable.dmg` для статической ссылки GitHub Releases.
+- Скрипты закрепляют официальную версию Sparkle и проверяют SHA-256 скачанного архива до сборки.
+- `prepare_release.sh` собирает релиз, подписывает stable-DMG для Sparkle и создаёт `appcast.xml`.
+- GitHub Actions автоматически создаёт стабильный GitHub Release при отправке тега версии.
+
+### Изменено
+
+- `build_app.sh` теперь встраивает Sparkle.framework, проверяет его архитектуру и подпись и создаёт одновременно версионный и stable-DMG.
+- Версия приложения повышена до **3.7** (build 13).
+- Добавлены установочные образы `Video-Editor-3.7-arm64.dmg` и `Video_Editor-stable.dmg`.
+
 ## [3.6.3] — 2026-08-21
 
 ### Исправлено
@@ -161,7 +180,8 @@
 - Скриншоты обрезаны по границам приложения, чтобы убрать рабочий стол и посторонние окна.
 - Упрощено описание структуры проекта.
 
-[Unreleased]: https://github.com/Coloded/Video_editor/compare/v3.6.3...HEAD
+[Unreleased]: https://github.com/Coloded/Video_editor/compare/v3.7...HEAD
+[3.7]: https://github.com/Coloded/Video_editor/compare/v3.6.3...v3.7
 [3.6.3]: https://github.com/Coloded/Video_editor/compare/v3.6.2...v3.6.3
 [3.6.2]: https://github.com/Coloded/Video_editor/compare/v3.6.1...v3.6.2
 [3.6.1]: https://github.com/Coloded/Video_editor/compare/v3.6...v3.6.1

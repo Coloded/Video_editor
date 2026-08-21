@@ -1,0 +1,24 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Video_Editor</title>
+        <item>
+            <title>3.7</title>
+            <pubDate>Fri, 21 Aug 2026 13:22:52 +0300</pubDate>
+            <link>https://github.com/Coloded/Video_editor</link>
+            <sparkle:version>13</sparkle:version>
+            <sparkle:shortVersionString>3.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>11.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[# Video Editor 3.7
+
+- Добавлена безопасная проверка обновлений через Sparkle 2.
+- В меню приложения появилась команда «Проверить обновления…».
+- Приложение автоматически проверяет наличие новой стабильной версии и спрашивает подтверждение перед установкой.
+- Для каждого релиза создаётся постоянный образ `Video_Editor-stable.dmg`.
+- Обновления проверяются криптографической подписью EdDSA перед установкой.
+]]></description>
+            <enclosure url="https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg" length="3515152" type="application/octet-stream" sparkle:edSignature="vrNHPXYPWiwW5oBSvTQrh7O+BuZCN7OuFu7JPGIhM0/jAr85jlvxLunjSCsjJZ42dU8BSzopc0I6+EWXn7NjAw=="/>
+        </item>
+    </channel>
+</rss>

@@ -19,9 +19,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>3.6.3</string>
+    <string>3.7</string>
     <key>CFBundleVersion</key>
-    <string>12</string>
+    <string>13</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.video</string>
     <key>LSMinimumSystemVersion</key>
@@ -30,6 +30,14 @@
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>SUFeedURL</key>
+    <string>https://raw.githubusercontent.com/Coloded/Video_editor/main/updates/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>PU4BqmmnwoOnyzSKHFXG8C03M4E2CIjkJg7Pw5yCJ5I=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

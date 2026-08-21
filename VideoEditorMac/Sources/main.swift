@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import AVKit
 import Foundation
+import Sparkle
 import UniformTypeIdentifiers
 
 private struct CompressionProfile {
@@ -261,6 +262,11 @@ private final class RangeTimelineView: NSControl {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate,
                          NSTableViewDataSource, NSTableViewDelegate {
     private var appLanguage = AppLanguage.initial()
+    private lazy var updaterController = SPUStandardUpdaterController(
+        startingUpdater: true,
+        updaterDelegate: nil,
+        userDriverDelegate: nil
+    )
     private let videoInputExtensions = [
         "mov", "mp4", "m4v", "mkv", "avi", "webm", "mpg", "mpeg",
         "ts", "mts", "m2ts", "vob", "3gp", "flv", "wmv", "ogv"
@@ -370,6 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMenu()
         configureWindow()
+        _ = updaterController
         guard verifyRuntimeRequirements() else { return }
         createDiagnosticSnapshotIfRequested()
         NSApp.activate(ignoringOtherApps: true)
@@ -418,6 +425,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             action: #selector(showAbout(_:)),
             keyEquivalent: ""
         )
+        applicationMenu.addItem(.separator())
+        let updateItem = applicationMenu.addItem(
+            withTitle: text("Проверить обновления…", "Check for Updates…"),
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updateItem.target = self
         applicationItem.submenu = applicationMenu
         mainMenu.addItem(applicationItem)
 
@@ -1058,11 +1072,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             .applicationVersion: displayedVersion,
             .credits: NSAttributedString(
                 string: text(
-                    "Внутренний движок FFmpeg\n\nВходные форматы:\n.mov, .mp4, .m4v, .mkv, .avi, .webm, .mpg, .mpeg, .ts, .mts, .m2ts, .vob, .3gp, .flv, .wmv, .ogv\n\nВыходные форматы:\n.mp4, .mov, .mkv\n\nМинимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26.",
-                    "Internal FFmpeg engine\n\nInput formats:\n.mov, .mp4, .m4v, .mkv, .avi, .webm, .mpg, .mpeg, .ts, .mts, .m2ts, .vob, .3gp, .flv, .wmv, .ogv\n\nOutput formats:\n.mp4, .mov, .mkv\n\nMinimum version: macOS 13 Ventura.\nmacOS 13, 14, 15, and 26 are supported."
+                    "Внутренний движок FFmpeg\nБезопасные обновления через Sparkle 2\n\nВходные форматы:\n.mov, .mp4, .m4v, .mkv, .avi, .webm, .mpg, .mpeg, .ts, .mts, .m2ts, .vob, .3gp, .flv, .wmv, .ogv\n\nВыходные форматы:\n.mp4, .mov, .mkv\n\nМинимальная версия: macOS 13 Ventura.\nПоддерживаются macOS 13, 14, 15 и 26.",
+                    "Internal FFmpeg engine\nSecure updates via Sparkle 2\n\nInput formats:\n.mov, .mp4, .m4v, .mkv, .avi, .webm, .mpg, .mpeg, .ts, .mts, .m2ts, .vob, .3gp, .flv, .wmv, .ogv\n\nOutput formats:\n.mp4, .mov, .mkv\n\nMinimum version: macOS 13 Ventura.\nmacOS 13, 14, 15, and 26 are supported."
                 )
             )
         ])
+    }
+
+    @objc private func checkForUpdates(_ sender: Any?) {
+        updaterController.checkForUpdates(sender)
     }
 
     @objc private func quitApplication(_ sender: Any?) {
