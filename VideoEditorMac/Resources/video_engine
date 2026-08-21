@@ -11,6 +11,7 @@ SCRIPT_DIR="${0:A:h}"
 COMMAND="cut"
 INPUT_RAW=""
 MANIFEST_RAW=""
+AUDIO_MANIFEST_RAW=""
 START_RAW=""
 END_RAW=""
 OUTPUT_RAW=""
@@ -80,7 +81,8 @@ video_editor — вырезание, сжатие и склейка аудио/�
   -s START -e END       Одновременно вырезать и сжать указанный фрагмент
 
 Параметры join:
-  --manifest FILE       TSV-файл: путь, старт и конец каждого ролика
+  --manifest FILE       TSV: путь, старт, конец и громкость каждого ролика
+  --audio-manifest FILE TSV: аудио, начало, конец, позиция и громкость
   -p, --profile NAME    Дополнительно сжать результат выбранным профилем
   --no-gpu, --cpu       Склеивать и кодировать процессором
 
@@ -379,11 +381,11 @@ run_join() {
   manifest="${MANIFEST_RAW:A}"
   [[ -f "$manifest" ]] || die "манифест не найден: $MANIFEST_RAW"
 
-  local -a inputs starts ends durations has_audio input_args
-  local clip_path start_raw end_raw start end duration clip_duration clip_bytes
+  local -a inputs starts ends durations volumes has_audio input_args clip_hdr clip_tonemap clip_transfers
+  local clip_path start_raw end_raw volume_raw start end duration clip_duration clip_bytes volume
   local clip_codec clip_pixel_format clip_color_transfer
   local source_total_bytes=0
-  while IFS=$'\t' read -r clip_path start_raw end_raw; do
+  while IFS=$'\t' read -r clip_path start_raw end_raw volume_raw; do
     [[ -n "$clip_path" ]] || continue
     [[ -f "$clip_path" ]] || die "ролик не найден: $clip_path"
     clip_bytes="$(stat -f "%z" "$clip_path" 2>/dev/null || true)"
@@ -393,13 +395,17 @@ run_join() {
     [[ -n "$clip_codec" ]] || die "в файле нет видеодорожки: $clip_path"
     clip_pixel_format="$(stream_value "$clip_path" "v:0" "pix_fmt")"
     clip_color_transfer="$(stream_value "$clip_path" "v:0" "color_transfer")"
-    case "$clip_color_transfer" in
-      smpte2084|arib-std-b67)
-        die "HDR-ролик пока нельзя безопасно склеить: $clip_path"
-        ;;
-    esac
-    if [[ "$clip_pixel_format" == *10* || "$clip_pixel_format" == *12* ]]; then
-      die "10/12-битный ролик пока нельзя безопасно склеить: $clip_path"
+    clip_transfers+=("$clip_color_transfer")
+    if [[ "$clip_color_transfer" == "smpte2084" || "$clip_color_transfer" == "arib-std-b67" ]]; then
+      clip_tonemap+=("1")
+    else
+      clip_tonemap+=("0")
+    fi
+    if [[ "$clip_color_transfer" == "smpte2084" || "$clip_color_transfer" == "arib-std-b67" ||
+          "$clip_pixel_format" == *10* || "$clip_pixel_format" == *12* ]]; then
+      clip_hdr+=("1")
+    else
+      clip_hdr+=("0")
     fi
     duration="$(media_duration "$clip_path")"
     [[ -n "$duration" && "$duration" != "N/A" ]] || \
@@ -411,10 +417,14 @@ run_join() {
       die "неверные границы фрагмента: $clip_path"
     clip_duration="$(awk -v start="$start" -v end="$end" \
       'BEGIN { printf "%.6f", end - start }')"
+    volume="${volume_raw:-1}"
+    awk -v value="$volume" 'BEGIN { exit !(value >= 0 && value <= 2) }' || \
+      die "громкость ролика должна быть от 0 до 2: $clip_path"
     inputs+=("${clip_path:A}")
     starts+=("$start")
     ends+=("$end")
     durations+=("$clip_duration")
+    volumes+=("$volume")
     if [[ -n "$(stream_value "$clip_path" "a:0" "codec_name")" ]]; then
       has_audio+=("1")
     else
@@ -422,7 +432,21 @@ run_join() {
     fi
   done < "$manifest"
 
-  (( ${#inputs[@]} >= 2 )) || die "для склейки нужно минимум два ролика"
+  (( ${#inputs[@]} >= 1 )) || die "для редактора нужен минимум один ролик"
+  local hdr_count=0
+  local tonemap_count=0
+  for volume in "${clip_hdr[@]}"; do
+    hdr_count=$((hdr_count + volume))
+  done
+  for volume in "${clip_tonemap[@]}"; do
+    tonemap_count=$((tonemap_count + volume))
+  done
+  if [[ "$HDR_MODE" == "auto" ]]; then
+    (( hdr_count == ${#inputs[@]} )) && HDR_MODE="preserve" || HDR_MODE="sdr"
+  fi
+  if [[ "$HDR_MODE" == "preserve" && "$hdr_count" != "${#inputs[@]}" ]]; then
+    die "HDR-склейка требует, чтобы все ролики были HDR/10-бит; для смешанных роликов выберите SDR"
+  fi
   local source_summary="${#inputs[@]} шт., $(format_file_size "$source_total_bytes")"
 
   local first="${inputs[1]}"
@@ -482,6 +506,16 @@ run_join() {
     target_width=$((first_width / 2 * 2))
     target_height=$((first_height / 2 * 2))
   fi
+  local color_mode_label="SDR 8-бит"
+  if [[ "$HDR_MODE" == "preserve" ]]; then
+    output_codec="hevc"
+    color_mode_label="HDR 10-бит, сохранён"
+    profile_label="${profile_label% SDR} HDR 10-бит"
+  elif (( tonemap_count > 0 )); then
+    color_mode_label="HDR → SDR 8-бит, tone mapping"
+  elif (( hdr_count > 0 )); then
+    color_mode_label="10/12-бит → SDR 8-бит"
+  fi
   target_fps="$(awk -v rate="$first_fps_raw" 'BEGIN {
     split(rate, part, "/")
     value = part[2] > 0 ? part[1] / part[2] : part[1]
@@ -493,13 +527,37 @@ run_join() {
   local total_duration="0"
   local filter_complex=""
   local concat_inputs=""
-  local index zero_index
+  local index zero_index video_filter linear_expr tonemap_peak
+  local hlg_base hlg_linear pq_power pq_linear
+  if [[ "$HDR_MODE" == "sdr" && "$hdr_count" -gt 0 ]]; then
+    hlg_base="if(lte(val/maxval,0.5),(val/maxval)*(val/maxval)/3,(exp(((val/maxval)-0.55991073)/0.17883277)+0.28466892)/12)"
+    hlg_linear="maxval*min(1,5*(${hlg_base}))"
+    pq_power="pow(val/maxval,1/78.84375)"
+    pq_linear="maxval*min(1,100*pow(max((${pq_power})-0.8359375,0)/(18.8515625-18.6875*(${pq_power})),1/0.1593017578125))"
+  fi
   for ((index = 1; index <= ${#inputs[@]}; index++)); do
     zero_index=$((index - 1))
     input_args+=("-i" "${inputs[index]}")
-    filter_complex+="[${zero_index}:v:0]trim=start=${starts[index]}:end=${ends[index]},setpts=PTS-STARTPTS,scale=${target_width}:${target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${target_width}:${target_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${target_fps},format=yuv420p[v${zero_index}];"
+    video_filter="trim=start=${starts[index]}:end=${ends[index]},setpts=PTS-STARTPTS"
+    if [[ "$HDR_MODE" == "sdr" && "${clip_tonemap[index]}" == "1" ]]; then
+      if [[ "${clip_transfers[index]}" == "arib-std-b67" ]]; then
+        linear_expr="$hlg_linear"
+        tonemap_peak="5"
+      else
+        linear_expr="$pq_linear"
+        tonemap_peak="100"
+      fi
+      video_filter+=",format=gbrpf32le,lutrgb=r='${linear_expr}':g='${linear_expr}':b='${linear_expr}',setparams=range=full:color_primaries=bt2020:color_trc=linear:colorspace=gbr,colorspace=space=bt709:primaries=bt709:trc=linear:format=yuv444p10,format=gbrpf32le,tonemap=hable:desat=0:peak=${tonemap_peak},setparams=range=full:color_primaries=bt709:color_trc=linear:colorspace=gbr,colorspace=all=bt709:format=yuv420p"
+    fi
+    video_filter+=",scale=${target_width}:${target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${target_width}:${target_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${target_fps}"
+    if [[ "$HDR_MODE" == "preserve" ]]; then
+      video_filter+=",format=p010le"
+    else
+      video_filter+=",format=yuv420p"
+    fi
+    filter_complex+="[${zero_index}:v:0]${video_filter}[v${zero_index}];"
     if [[ "${has_audio[index]}" == "1" ]]; then
-      filter_complex+="[${zero_index}:a:0]atrim=start=${starts[index]}:end=${ends[index]},asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${zero_index}];"
+      filter_complex+="[${zero_index}:a:0]atrim=start=${starts[index]}:end=${ends[index]},asetpts=PTS-STARTPTS,volume=${volumes[index]},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${zero_index}];"
     else
       filter_complex+="anullsrc=r=48000:cl=stereo,atrim=duration=${durations[index]},asetpts=PTS-STARTPTS[a${zero_index}];"
     fi
@@ -507,7 +565,47 @@ run_join() {
     total_duration="$(awk -v total="$total_duration" -v clip="${durations[index]}" \
       'BEGIN { printf "%.6f", total + clip }')"
   done
-  filter_complex+="${concat_inputs}concat=n=${#inputs[@]}:v=1:a=1[outv][outa]"
+  filter_complex+="${concat_inputs}concat=n=${#inputs[@]}:v=1:a=1[joinedv][joineda]"
+
+  local -a overlay_paths overlay_starts overlay_ends overlay_positions overlay_volumes
+  local audio_manifest audio_path audio_start_raw audio_end_raw audio_position_raw audio_volume_raw
+  local audio_start audio_end audio_position audio_duration audio_volume audio_index ffmpeg_audio_index delay_ms
+  if [[ -n "$AUDIO_MANIFEST_RAW" ]]; then
+    audio_manifest="${AUDIO_MANIFEST_RAW:A}"
+    [[ -f "$audio_manifest" ]] || die "манифест аудио не найден: $AUDIO_MANIFEST_RAW"
+    while IFS=$'\t' read -r audio_path audio_start_raw audio_end_raw audio_position_raw audio_volume_raw; do
+      [[ -n "$audio_path" ]] || continue
+      [[ -f "$audio_path" ]] || die "аудиофайл не найден: $audio_path"
+      [[ -n "$(stream_value "$audio_path" "a:0" "codec_name")" ]] || die "в файле нет аудиодорожки: $audio_path"
+      audio_duration="$(media_duration "$audio_path")"
+      audio_start="$(parse_time "$audio_start_raw")" || die "неверный старт аудио: $audio_path"
+      audio_end="$(parse_time "$audio_end_raw")" || die "неверный конец аудио: $audio_path"
+      audio_position="$(parse_time "$audio_position_raw")" || die "неверная позиция аудио: $audio_path"
+      audio_volume="${audio_volume_raw:-1}"
+      awk -v start="$audio_start" -v end="$audio_end" -v duration="$audio_duration" -v position="$audio_position" -v volume="$audio_volume" \
+        'BEGIN { exit !(start >= 0 && end > start && end <= duration + 0.001 && position >= 0 && volume >= 0 && volume <= 2) }' || \
+        die "неверные параметры аудиодорожки: $audio_path"
+      overlay_paths+=("${audio_path:A}")
+      overlay_starts+=("$audio_start")
+      overlay_ends+=("$audio_end")
+      overlay_positions+=("$audio_position")
+      overlay_volumes+=("$audio_volume")
+      input_args+=("-i" "${audio_path:A}")
+    done < "$audio_manifest"
+  fi
+
+  if (( ${#overlay_paths[@]} > 0 )); then
+    local mix_inputs="[joineda]"
+    for ((audio_index = 1; audio_index <= ${#overlay_paths[@]}; audio_index++)); do
+      ffmpeg_audio_index=$((${#inputs[@]} + audio_index - 1))
+      delay_ms="$(awk -v value="${overlay_positions[audio_index]}" 'BEGIN { printf "%d", value * 1000 + 0.5 }')"
+      filter_complex+=";[${ffmpeg_audio_index}:a:0]atrim=start=${overlay_starts[audio_index]}:end=${overlay_ends[audio_index]},asetpts=PTS-STARTPTS,volume=${overlay_volumes[audio_index]},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${delay_ms}|${delay_ms},apad,atrim=duration=${total_duration}[overlay${audio_index}]"
+      mix_inputs+="[overlay${audio_index}]"
+    done
+    filter_complex+=";[joinedv]null[outv];${mix_inputs}amix=inputs=$((${#overlay_paths[@]} + 1)):duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.98[outa]"
+  else
+    filter_complex+=";[joinedv]null[outv];[joineda]anull[outa]"
+  fi
 
   local first_dir="${first:h}"
   local first_name="${first:t:r}"
@@ -564,16 +662,33 @@ run_join() {
   maxrate="$(awk -v value="$video_bitrate" 'BEGIN { printf "%.3f", value * 1.15 }')"
   bufsize="$(awk -v value="$video_bitrate" 'BEGIN { printf "%.3f", value * 2 }')"
 
-  local -a video_args
+  local -a video_args output_color_args
+  output_color_args=()
+  if [[ "$HDR_MODE" == "preserve" ]]; then
+    local first_primaries first_transfer first_space
+    first_primaries="$(stream_value "$first" "v:0" "color_primaries")"
+    first_transfer="$(stream_value "$first" "v:0" "color_transfer")"
+    first_space="$(stream_value "$first" "v:0" "color_space")"
+    [[ -n "$first_primaries" ]] && output_color_args+=(-color_primaries "$first_primaries")
+    [[ -n "$first_transfer" ]] && output_color_args+=(-color_trc "$first_transfer")
+    [[ -n "$first_space" ]] && output_color_args+=(-colorspace "$first_space")
+  else
+    output_color_args=(-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
+  fi
   if [[ "$USE_SOFTWARE" == "0" ]] && ffmpeg -hide_banner -h "encoder=${output_codec}_videotoolbox" >/dev/null 2>&1; then
     video_encoder="${output_codec}_videotoolbox"
     encoder_label="Apple VideoToolbox"
     video_args=(-c:v "$video_encoder" -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -allow_sw 1)
+    if [[ "$HDR_MODE" == "preserve" ]]; then
+      video_args+=(-profile:v main10 -pix_fmt p010le)
+    fi
   else
     if [[ "$output_codec" == "hevc" ]]; then
       video_encoder="libx265"
       encoder_label="CPU libx265"
-      video_args=(-c:v "$video_encoder" -preset medium -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -pix_fmt yuv420p)
+      local software_pixel_format="yuv420p"
+      [[ "$HDR_MODE" == "preserve" ]] && software_pixel_format="yuv420p10le"
+      video_args=(-c:v "$video_encoder" -preset medium -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -pix_fmt "$software_pixel_format")
     else
       video_encoder="libx264"
       encoder_label="CPU libx264"
@@ -603,6 +718,7 @@ run_join() {
   echo "Длительность:  $(format_time "$total_duration")"
   echo "Профиль:       $profile_label"
   echo "Разрешение:    ${target_width}x${target_height}, ${target_fps} fps"
+  echo "Цвет:          $color_mode_label"
   echo "Видео:         ${output_codec:u}, $encoder_label, ${video_bitrate} Мбит/с"
   if [[ "$video_encoder" == *_videotoolbox ]]; then
     echo "Ускорение:     Apple VideoToolbox (аппаратный медиадвижок)"
@@ -651,6 +767,7 @@ run_join() {
     -map "[outv]" \
     -map "[outa]" \
     "${video_args[@]}" \
+    "${output_color_args[@]}" \
     -c:a aac \
     -b:a 192k \
     -ar 48000 \
@@ -844,6 +961,11 @@ while (( $# > 0 )); do
     --manifest)
       (( $# >= 2 )) || die "после $1 нужно указать файл"
       MANIFEST_RAW="$2"
+      shift 2
+      ;;
+    --audio-manifest)
+      (( $# >= 2 )) || die "после $1 нужно указать файл"
+      AUDIO_MANIFEST_RAW="$2"
       shift 2
       ;;
     -o|--output)

@@ -32,3 +32,9 @@
 # Temporary FFmpeg output
 *.tmp.*
 *.log
+
+# External projects cloned only for architecture/reference research
+/reference/HandBrake/
+
+# Local source media used only for testing
+/photo/

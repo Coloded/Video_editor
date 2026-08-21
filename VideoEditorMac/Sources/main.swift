@@ -24,6 +24,7 @@ private struct SourceInfo {
     let pixelFormat: String
     let colorTransfer: String
     let duration: Double
+    let hasAudio: Bool
 
     var shortSide: Int { min(width, height) }
     var isHDR: Bool { colorTransfer == "smpte2084" || colorTransfer == "arib-std-b67" }
@@ -37,17 +38,37 @@ private struct JoinClip {
     var lowerValue: Double
     var upperValue: Double
     var thumbnails: [NSImage]
+    var volume: Double
+    var waveform: [CGFloat]
+}
+
+private struct OverlayAudio {
+    let id: UUID
+    let url: URL
+    let duration: Double
+    var sourceStart: Double
+    var sourceEnd: Double
+    var timelineStart: Double
+    var volume: Double
+    var waveform: [CGFloat]
+}
+
+private enum OutputColorMode {
+    case hdr
+    case sdr
 }
 
 private enum EditorMode: Int {
     case compress = 0
-    case cut = 1
-    case join = 2
+    case join = 1
+    // Legacy internal path kept for opening older diagnostic scenarios.
+    // It is no longer exposed as a separate application mode.
+    case cut = 2
 }
 
 private enum CompressionChoice {
-    case original
-    case profile(CompressionProfile)
+    case original(OutputColorMode)
+    case profile(CompressionProfile, OutputColorMode)
     case cancelled
 }
 
@@ -258,6 +279,466 @@ private final class RangeTimelineView: NSControl {
     }
 }
 
+private enum AudioTimelineDragMode {
+    case trimStart
+    case trimEnd
+    case move
+}
+
+private final class AudioTimelineView: NSControl {
+    var projectDuration: Double = 1 { didSet { projectDuration = max(0.001, projectDuration); needsDisplay = true } }
+    var timelineStart: Double = 0 { didSet { needsDisplay = true } }
+    var sourceStart: Double = 0 { didSet { needsDisplay = true } }
+    var sourceEnd: Double = 0 { didSet { needsDisplay = true } }
+    var sourceDuration: Double = 0 { didSet { needsDisplay = true } }
+    var waveform: [CGFloat] = [] { didSet { needsDisplay = true } }
+    var trackTitle = "" { didSet { needsDisplay = true } }
+    var emptyTitle = "" { didSet { needsDisplay = true } }
+    var onChange: ((Double, Double, Double) -> Void)?
+
+    private var dragMode: AudioTimelineDragMode?
+    private var dragStartX: CGFloat = 0
+    private var initialTimelineStart: Double = 0
+    private var initialSourceStart: Double = 0
+    private var initialSourceEnd: Double = 0
+
+    override var isFlipped: Bool { true }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 68) }
+
+    private var trackRect: NSRect { bounds.insetBy(dx: 8, dy: 7) }
+    private var visibleDuration: Double { max(0.001, sourceEnd - sourceStart) }
+    private func x(for time: Double) -> CGFloat {
+        trackRect.minX + CGFloat(min(projectDuration, max(0, time)) / projectDuration) * trackRect.width
+    }
+    private func timeDelta(for pixels: CGFloat) -> Double {
+        Double(pixels / max(1, trackRect.width)) * projectDuration
+    }
+    private var clipRect: NSRect {
+        let left = x(for: timelineStart)
+        let right = x(for: min(projectDuration, timelineStart + visibleDuration))
+        return NSRect(x: left, y: trackRect.minY, width: max(8, right - left), height: trackRect.height)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.controlBackgroundColor.setFill()
+        NSBezierPath(roundedRect: trackRect, xRadius: 6, yRadius: 6).fill()
+        guard sourceDuration > 0, sourceEnd > sourceStart else {
+            let message = emptyTitle
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            message.draw(at: NSPoint(x: trackRect.minX + 10, y: trackRect.midY - 8), withAttributes: attributes)
+            return
+        }
+
+        let rect = clipRect
+        NSColor.controlAccentColor.withAlphaComponent(0.24).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+        NSColor.controlAccentColor.setStroke()
+        let outline = NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5)
+        outline.lineWidth = 2
+        outline.stroke()
+        drawWaveform(in: rect.insetBy(dx: 8, dy: 7))
+
+        let titleAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: NSColor.labelColor
+        ]
+        trackTitle.draw(
+            in: NSRect(x: rect.minX + 9, y: rect.minY + 3, width: max(0, rect.width - 18), height: 14),
+            withAttributes: titleAttributes
+        )
+        drawHandle(at: rect.minX)
+        drawHandle(at: rect.maxX)
+    }
+
+    private func drawWaveform(in rect: NSRect) {
+        guard rect.width > 2, rect.height > 2, !waveform.isEmpty else { return }
+        let first = Int((sourceStart / max(sourceDuration, 0.001)) * Double(waveform.count - 1))
+        let last = Int((sourceEnd / max(sourceDuration, 0.001)) * Double(waveform.count - 1))
+        let sampleCount = max(1, last - first + 1)
+        let columns = max(1, Int(rect.width / 2))
+        let path = NSBezierPath()
+        for column in 0..<columns {
+            let index = min(waveform.count - 1, first + column * sampleCount / columns)
+            let amplitude = min(1, max(0.04, waveform[index]))
+            let height = rect.height * amplitude
+            let x = rect.minX + CGFloat(column) * rect.width / CGFloat(columns)
+            path.move(to: NSPoint(x: x, y: rect.midY - height / 2))
+            path.line(to: NSPoint(x: x, y: rect.midY + height / 2))
+        }
+        NSColor.controlAccentColor.setStroke()
+        path.lineWidth = 1.2
+        path.stroke()
+    }
+
+    private func drawHandle(at x: CGFloat) {
+        let handle = NSRect(x: x - 5, y: trackRect.minY - 2, width: 10, height: trackRect.height + 4)
+        NSColor.white.setFill()
+        NSBezierPath(roundedRect: handle, xRadius: 3, yRadius: 3).fill()
+        NSColor.controlAccentColor.setStroke()
+        let outline = NSBezierPath(roundedRect: handle, xRadius: 3, yRadius: 3)
+        outline.lineWidth = 2
+        outline.stroke()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled, sourceEnd > sourceStart else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        let rect = clipRect
+        if abs(point.x - rect.minX) <= 12 {
+            dragMode = .trimStart
+        } else if abs(point.x - rect.maxX) <= 12 {
+            dragMode = .trimEnd
+        } else if rect.contains(point) {
+            dragMode = .move
+        } else {
+            return
+        }
+        dragStartX = point.x
+        initialTimelineStart = timelineStart
+        initialSourceStart = sourceStart
+        initialSourceEnd = sourceEnd
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        updateDrag(at: convert(event.locationInWindow, from: nil).x)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        updateDrag(at: convert(event.locationInWindow, from: nil).x)
+        dragMode = nil
+    }
+
+    private func updateDrag(at x: CGFloat) {
+        guard let dragMode else { return }
+        let delta = timeDelta(for: x - dragStartX)
+        let minimum = min(0.1, max(0.01, sourceDuration))
+        switch dragMode {
+        case .move:
+            timelineStart = min(max(0, initialTimelineStart + delta), max(0, projectDuration - visibleDuration))
+        case .trimStart:
+            let minimumDelta = max(-initialSourceStart, -initialTimelineStart)
+            let maximumDelta = initialSourceEnd - initialSourceStart - minimum
+            let applied = min(max(delta, minimumDelta), maximumDelta)
+            timelineStart = initialTimelineStart + applied
+            sourceStart = initialSourceStart + applied
+        case .trimEnd:
+            let maxBySource = sourceDuration - initialSourceEnd
+            let maxByProject = projectDuration - initialTimelineStart - (initialSourceEnd - initialSourceStart)
+            let minimumDelta = -(initialSourceEnd - initialSourceStart - minimum)
+            let applied = min(max(delta, minimumDelta), min(maxBySource, maxByProject))
+            sourceEnd = initialSourceEnd + applied
+        }
+        onChange?(timelineStart, sourceStart, sourceEnd)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard sourceEnd > sourceStart else { return }
+        let rect = clipRect
+        addCursorRect(NSRect(x: rect.minX - 10, y: 0, width: 20, height: bounds.height), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: rect.maxX - 10, y: 0, width: 20, height: bounds.height), cursor: .resizeLeftRight)
+        if rect.width > 24 {
+            addCursorRect(NSRect(x: rect.minX + 10, y: 0, width: rect.width - 20, height: bounds.height), cursor: .openHand)
+        }
+    }
+}
+
+private struct EditorVideoTimelineItem {
+    let id: UUID
+    let title: String
+    let sourceDuration: Double
+    var sourceStart: Double
+    var sourceEnd: Double
+    let thumbnails: [NSImage]
+    let hasLinkedAudio: Bool
+    let volume: Double
+    let linkedWaveform: [CGFloat]
+}
+
+private struct EditorAudioTimelineItem {
+    let id: UUID
+    let title: String
+    let sourceDuration: Double
+    var sourceStart: Double
+    var sourceEnd: Double
+    var timelineStart: Double
+    let waveform: [CGFloat]
+}
+
+private enum EditorTimelineDrag {
+    case videoStart(Int)
+    case videoEnd(Int)
+    case videoMove(Int)
+    case audioStart(UUID)
+    case audioEnd(UUID)
+    case audioMove(UUID)
+}
+
+private enum EditorTimelineContextTarget {
+    case video(Int)
+    case linkedAudio(Int)
+    case audio(UUID)
+}
+
+private final class EditorTimelineView: NSControl {
+    var videos: [EditorVideoTimelineItem] = [] { didSet { needsDisplay = true } }
+    var audios: [EditorAudioTimelineItem] = [] { didSet { needsDisplay = true } }
+    var selectedVideoID: UUID? { didSet { needsDisplay = true } }
+    var selectedAudioID: UUID? { didSet { needsDisplay = true } }
+    var playheadTime: Double = 0 { didSet { needsDisplay = true } }
+    var onSelectVideo: ((Int) -> Void)?
+    var onSelectAudio: ((UUID) -> Void)?
+    var onReorderVideo: ((Int, Int) -> Void)?
+    var onTrimVideo: ((Int, Double, Double) -> Void)?
+    var onChangeAudio: ((UUID, Double, Double, Double) -> Void)?
+    var onSeek: ((Double) -> Void)?
+    var onContextMenu: ((EditorTimelineContextTarget, Double) -> NSMenu?)?
+
+    private let labelWidth: CGFloat = 44
+    private let rulerHeight: CGFloat = 25
+    private let videoHeight: CGFloat = 88
+    private let linkedAudioHeight: CGFloat = 42
+    private let freeAudioHeight: CGFloat = 58
+    private var drag: EditorTimelineDrag?
+    private var dragStartX: CGFloat = 0
+    private var initialStart: Double = 0
+    private var initialEnd: Double = 0
+    private var initialPosition: Double = 0
+
+    override var isFlipped: Bool { true }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 223) }
+    private var duration: Double { max(0.001, videos.reduce(0) { $0 + max(0, $1.sourceEnd - $1.sourceStart) }) }
+    private var contentRect: NSRect { NSRect(x: labelWidth, y: 0, width: max(1, bounds.width - labelWidth - 5), height: bounds.height) }
+    private func x(_ time: Double) -> CGFloat { contentRect.minX + CGFloat(min(duration, max(0, time)) / duration) * contentRect.width }
+    private func time(at x: CGFloat) -> Double { min(duration, max(0, Double((x - contentRect.minX) / contentRect.width) * duration)) }
+    private func delta(_ pixels: CGFloat) -> Double { Double(pixels / contentRect.width) * duration }
+    private func videoStartTime(_ index: Int) -> Double {
+        videos[..<index].reduce(0) { $0 + max(0, $1.sourceEnd - $1.sourceStart) }
+    }
+    private func videoRect(_ index: Int) -> NSRect {
+        let start = videoStartTime(index)
+        return NSRect(x: x(start), y: rulerHeight + 4, width: max(12, x(start + videos[index].sourceEnd - videos[index].sourceStart) - x(start)), height: videoHeight - 8)
+    }
+    private func linkedAudioRect(_ index: Int) -> NSRect {
+        let rect = videoRect(index)
+        return NSRect(x: rect.minX, y: rulerHeight + videoHeight + 3, width: rect.width, height: linkedAudioHeight - 6)
+    }
+    private func audioRect(_ audio: EditorAudioTimelineItem) -> NSRect {
+        NSRect(
+            x: x(audio.timelineStart), y: rulerHeight + videoHeight + linkedAudioHeight + 4,
+            width: max(12, x(min(duration, audio.timelineStart + audio.sourceEnd - audio.sourceStart)) - x(audio.timelineStart)),
+            height: freeAudioHeight - 8
+        )
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor(calibratedWhite: 0.10, alpha: 1).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 7, yRadius: 7).fill()
+        drawLaneLabel("V1", y: rulerHeight, height: videoHeight)
+        drawLaneLabel("A1", y: rulerHeight + videoHeight, height: linkedAudioHeight)
+        drawLaneLabel("A2", y: rulerHeight + videoHeight + linkedAudioHeight, height: freeAudioHeight)
+        drawRuler()
+        drawLaneBackground(y: rulerHeight, height: videoHeight)
+        drawLaneBackground(y: rulerHeight + videoHeight, height: linkedAudioHeight)
+        drawLaneBackground(y: rulerHeight + videoHeight + linkedAudioHeight, height: freeAudioHeight)
+
+        for index in videos.indices {
+            drawVideo(videos[index], in: videoRect(index), selected: videos[index].id == selectedVideoID)
+            if videos[index].hasLinkedAudio {
+                drawLinkedAudio(videos[index], in: linkedAudioRect(index))
+            }
+        }
+        for audio in audios {
+            drawAudio(audio, in: audioRect(audio), selected: audio.id == selectedAudioID)
+        }
+        let playheadX = x(playheadTime)
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        let playhead = NSBezierPath()
+        playhead.move(to: NSPoint(x: playheadX, y: rulerHeight - 7))
+        playhead.line(to: NSPoint(x: playheadX, y: bounds.maxY - 4))
+        playhead.lineWidth = 1.5
+        playhead.stroke()
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(x: playheadX - 4, y: rulerHeight - 10, width: 8, height: 8)).fill()
+    }
+
+    private func drawRuler() {
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular), .foregroundColor: NSColor.lightGray]
+        for tick in 0...10 {
+            let value = duration * Double(tick) / 10
+            let tickX = x(value)
+            NSColor.darkGray.setStroke()
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: tickX, y: rulerHeight - 7))
+            path.line(to: NSPoint(x: tickX, y: bounds.maxY - 5))
+            path.lineWidth = 0.5
+            path.stroke()
+            String(format: "%02d:%02d", Int(value) / 60, Int(value) % 60).draw(at: NSPoint(x: tickX + 3, y: 5), withAttributes: attributes)
+        }
+    }
+
+    private func drawLaneBackground(y: CGFloat, height: CGFloat) {
+        NSColor(calibratedWhite: 0.15, alpha: 1).setFill()
+        NSRect(x: contentRect.minX, y: y, width: contentRect.width, height: height).fill()
+    }
+
+    private func drawLaneLabel(_ title: String, y: CGFloat, height: CGFloat) {
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12, weight: .bold), .foregroundColor: NSColor.lightGray]
+        title.draw(at: NSPoint(x: 12, y: y + height / 2 - 8), withAttributes: attributes)
+    }
+
+    private func drawVideo(_ item: EditorVideoTimelineItem, in rect: NSRect, selected: Bool) {
+        NSColor.systemBlue.withAlphaComponent(0.48).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+        if !item.thumbnails.isEmpty {
+            let imageRect = NSRect(x: rect.minX + 3, y: rect.minY + 19, width: rect.width - 6, height: rect.height - 22)
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(roundedRect: imageRect, xRadius: 2, yRadius: 2).addClip()
+            let width = imageRect.width / CGFloat(item.thumbnails.count)
+            for (offset, image) in item.thumbnails.enumerated() {
+                image.draw(in: NSRect(x: imageRect.minX + CGFloat(offset) * width, y: imageRect.minY, width: width + 1, height: imageRect.height))
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        drawTitle(item.title, in: rect)
+        drawOutlineAndHandles(rect, selected: selected, color: .systemBlue)
+    }
+
+    private func drawLinkedAudio(_ item: EditorVideoTimelineItem, in rect: NSRect) {
+        let muted = item.volume <= 0.001
+        (muted ? NSColor.systemGray : NSColor.systemTeal).withAlphaComponent(0.48).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3).fill()
+        drawWaveform(item.linkedWaveform, sourceStart: item.sourceStart, sourceEnd: item.sourceEnd, sourceDuration: item.sourceDuration, in: rect.insetBy(dx: 5, dy: 10))
+        drawTitle(muted ? "🔇 \(item.title)" : "♫ \(item.title)", in: rect)
+    }
+
+    private func drawAudio(_ item: EditorAudioTimelineItem, in rect: NSRect, selected: Bool) {
+        NSColor.systemPurple.withAlphaComponent(0.48).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+        drawWaveform(item.waveform, sourceStart: item.sourceStart, sourceEnd: item.sourceEnd, sourceDuration: item.sourceDuration, in: rect.insetBy(dx: 6, dy: 15))
+        drawTitle(item.title, in: rect)
+        drawOutlineAndHandles(rect, selected: selected, color: .systemPurple)
+    }
+
+    private func drawTitle(_ title: String, in rect: NSRect) {
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 10.5, weight: .medium), .foregroundColor: NSColor.white]
+        title.draw(in: NSRect(x: rect.minX + 6, y: rect.minY + 3, width: max(0, rect.width - 12), height: 14), withAttributes: attributes)
+    }
+
+    private func drawWaveform(_ samples: [CGFloat], sourceStart: Double, sourceEnd: Double, sourceDuration: Double, in rect: NSRect) {
+        guard !samples.isEmpty, rect.width > 1 else { return }
+        let first = Int(sourceStart / max(0.001, sourceDuration) * Double(samples.count - 1))
+        let last = Int(sourceEnd / max(0.001, sourceDuration) * Double(samples.count - 1))
+        let columns = max(1, Int(rect.width / 2))
+        let path = NSBezierPath()
+        for column in 0..<columns {
+            let index = min(samples.count - 1, first + column * max(1, last - first) / columns)
+            let height = max(1, rect.height * samples[index])
+            let columnX = rect.minX + CGFloat(column) * rect.width / CGFloat(columns)
+            path.move(to: NSPoint(x: columnX, y: rect.midY - height / 2))
+            path.line(to: NSPoint(x: columnX, y: rect.midY + height / 2))
+        }
+        NSColor.white.withAlphaComponent(0.75).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+
+    private func drawOutlineAndHandles(_ rect: NSRect, selected: Bool, color: NSColor) {
+        (selected ? NSColor.white : color).setStroke()
+        let path = NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
+        path.lineWidth = selected ? 2.5 : 1
+        path.stroke()
+        guard selected else { return }
+        for handleX in [rect.minX, rect.maxX] {
+            NSColor.white.setFill()
+            NSBezierPath(roundedRect: NSRect(x: handleX - 4, y: rect.minY + 5, width: 8, height: rect.height - 10), xRadius: 3, yRadius: 3).fill()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        for audio in audios.reversed() {
+            let rect = audioRect(audio)
+            if abs(point.x - rect.minX) <= 10 && point.y >= rect.minY && point.y <= rect.maxY { begin(.audioStart(audio.id), point.x, audio.sourceStart, audio.sourceEnd, audio.timelineStart); onSelectAudio?(audio.id); return }
+            if abs(point.x - rect.maxX) <= 10 && point.y >= rect.minY && point.y <= rect.maxY { begin(.audioEnd(audio.id), point.x, audio.sourceStart, audio.sourceEnd, audio.timelineStart); onSelectAudio?(audio.id); return }
+            if rect.contains(point) { begin(.audioMove(audio.id), point.x, audio.sourceStart, audio.sourceEnd, audio.timelineStart); onSelectAudio?(audio.id); return }
+        }
+        for index in videos.indices.reversed() {
+            if linkedAudioRect(index).contains(point) { onSelectVideo?(index); return }
+            let rect = videoRect(index)
+            if abs(point.x - rect.minX) <= 10 && point.y >= rect.minY && point.y <= rect.maxY { begin(.videoStart(index), point.x, videos[index].sourceStart, videos[index].sourceEnd, 0); onSelectVideo?(index); return }
+            if abs(point.x - rect.maxX) <= 10 && point.y >= rect.minY && point.y <= rect.maxY { begin(.videoEnd(index), point.x, videos[index].sourceStart, videos[index].sourceEnd, 0); onSelectVideo?(index); return }
+            if rect.contains(point) { begin(.videoMove(index), point.x, videos[index].sourceStart, videos[index].sourceEnd, 0); onSelectVideo?(index); return }
+        }
+        if contentRect.contains(point) { onSeek?(time(at: point.x)) }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard isEnabled else { return nil }
+        let point = convert(event.locationInWindow, from: nil)
+        for audio in audios.reversed() where audioRect(audio).contains(point) {
+            onSelectAudio?(audio.id)
+            return onContextMenu?(.audio(audio.id), time(at: point.x))
+        }
+        for index in videos.indices.reversed() {
+            if linkedAudioRect(index).contains(point), videos[index].hasLinkedAudio {
+                onSelectVideo?(index)
+                return onContextMenu?(.linkedAudio(index), time(at: point.x))
+            }
+            if videoRect(index).contains(point) {
+                onSelectVideo?(index)
+                return onContextMenu?(.video(index), time(at: point.x))
+            }
+        }
+        return nil
+    }
+
+    private func begin(_ value: EditorTimelineDrag, _ x: CGFloat, _ start: Double, _ end: Double, _ position: Double) {
+        drag = value; dragStartX = x; initialStart = start; initialEnd = end; initialPosition = position
+    }
+    override func mouseDragged(with event: NSEvent) { updateDrag(convert(event.locationInWindow, from: nil).x, finished: false) }
+    override func mouseUp(with event: NSEvent) { updateDrag(convert(event.locationInWindow, from: nil).x, finished: true); drag = nil }
+
+    private func updateDrag(_ currentX: CGFloat, finished: Bool) {
+        guard let drag else { return }
+        let change = delta(currentX - dragStartX)
+        let minimum = 0.1
+        switch drag {
+        case .videoStart(let index):
+            let start = min(max(0, initialStart + change), initialEnd - minimum)
+            onTrimVideo?(index, start, initialEnd)
+        case .videoEnd(let index):
+            let end = max(initialStart + minimum, min(videos[index].sourceDuration, initialEnd + change))
+            onTrimVideo?(index, initialStart, end)
+        case .videoMove(let index):
+            if finished {
+                let targetTime = time(at: currentX)
+                var target = videos.count - 1
+                for candidate in videos.indices where targetTime < videoStartTime(candidate) + (videos[candidate].sourceEnd - videos[candidate].sourceStart) / 2 { target = candidate; break }
+                if target != index { onReorderVideo?(index, target) }
+            }
+        case .audioMove(let id):
+            guard let audio = audios.first(where: { $0.id == id }) else { return }
+            let position = min(max(0, initialPosition + change), max(0, duration - (audio.sourceEnd - audio.sourceStart)))
+            onChangeAudio?(id, position, initialStart, initialEnd)
+        case .audioStart(let id):
+            let applied = min(max(change, max(-initialStart, -initialPosition)), initialEnd - initialStart - minimum)
+            onChangeAudio?(id, initialPosition + applied, initialStart + applied, initialEnd)
+        case .audioEnd(let id):
+            guard let audio = audios.first(where: { $0.id == id }) else { return }
+            let maximum = min(audio.sourceDuration - initialEnd, duration - initialPosition - (initialEnd - initialStart))
+            let applied = min(max(change, -(initialEnd - initialStart - minimum)), maximum)
+            onChangeAudio?(id, initialPosition, initialStart, initialEnd + applied)
+        }
+    }
+}
+
 @available(macOS 13.0, *)
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate,
                          NSTableViewDataSource, NSTableViewDelegate {
@@ -292,7 +773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private var window: NSWindow!
     private let modeControl = NSSegmentedControl(
-        labels: ["", "", ""],
+        labels: ["", ""],
         trackingMode: .selectOne,
         target: nil,
         action: nil
@@ -307,17 +788,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let endField = NSTextField()
     private let playerView = AVPlayerView()
     private let timelineView = RangeTimelineView()
+    private let audioTimelineView = AudioTimelineView()
+    private let editorTimelineView = EditorTimelineView()
     private let selectionLabel = NSTextField(labelWithString: "")
     private let joinTable = NSTableView()
+    private let overlayAudioTable = NSTableView()
+    private let clipVolumeSlider = NSSlider(value: 1, minValue: 0, maxValue: 2, target: nil, action: nil)
+    private let clipVolumeLabel = NSTextField(labelWithString: "100%")
+    private let overlayVolumeSlider = NSSlider(value: 1, minValue: 0, maxValue: 2, target: nil, action: nil)
+    private let overlayVolumeLabel = NSTextField(labelWithString: "100%")
+    private let overlayPositionField = NSTextField()
+    private let overlayStartField = NSTextField()
+    private let overlayEndField = NSTextField()
     private var playerHeightConstraint: NSLayoutConstraint!
     private var joinListHeightConstraint: NSLayoutConstraint!
     private var joinStack: NSStackView!
     private var joinClips: [JoinClip] = []
+    private var overlayAudioTracks: [OverlayAudio] = []
     private var joinEditButtons: [NSButton] = []
     private var profileRow: NSStackView!
     private var cutRow: NSStackView!
     private var previewStack: NSStackView!
+    private var workspaceRow: NSStackView!
+    private var workspaceColumnsConstraint: NSLayoutConstraint!
     private var playerTimeObserver: Any?
+    private var previewAudioRefreshWorkItem: DispatchWorkItem?
+    private var timelineContextTarget: EditorTimelineContextTarget?
+    private var timelineContextProjectTime: Double = 0
 
     private let statusLabel = NSTextField(labelWithString: "")
     private let percentLabel = NSTextField(labelWithString: "0%")
@@ -336,7 +833,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var selectedInputURL: URL?
     private var selectedOutputURL: URL?
     private var processManifestURL: URL?
+    private var processAudioManifestURL: URL?
     private var pendingCompressionProfile: CompressionProfile?
+    private var pendingOutputColorMode: OutputColorMode = .sdr
     private var process: Process?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
@@ -490,15 +989,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             ("Порядок сверху вниз", "Order top to bottom"), ("Показать", "Show"),
             ("Выберите файл", "Select a file"), ("Файл не выбран", "No file selected"),
             ("Ролики не выбраны", "No clips selected"),
-            ("Добавьте минимум два ролика", "Add at least two clips"),
-            ("Добавьте ещё один ролик", "Add one more clip"),
+            ("Добавьте ролик", "Add a clip"),
             ("Анализирую ролики", "Analyzing clips"), ("Анализ качества", "Analyzing quality"),
             ("Загрузка видео", "Loading video"), ("Анализирую файл…", "Analyzing file…"),
             ("Видео не найдено", "No video found"), ("Нет видеодорожки", "No video track"),
             ("Нет подходящих профилей", "No suitable profiles"),
             ("Нет подходящего профиля", "No suitable profile"),
             ("Готов к запуску", "Ready"), ("Готов к вырезанию", "Ready to cut"),
-            ("Готов к склейке", "Ready to join"), ("Сжимаю видео", "Compressing video"),
+            ("Готов к редактированию", "Ready to edit"), ("Сжимаю видео", "Compressing video"),
             ("Вырезаю фрагмент", "Cutting clip"), ("Вырезаю и сжимаю", "Cutting and compressing"),
             ("Склеиваю ролики", "Joining clips"), ("Склеиваю и сжимаю", "Joining and compressing"),
             ("Готовлю сжатие", "Preparing compression"), ("Готовлю вырезание", "Preparing cut"),
@@ -507,7 +1005,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             ("Ошибка", "Error"), ("Готово", "Done"), ("Остановлено", "Stopped"),
             ("Останавливаю", "Stopping"), ("Остановить", "Stop"),
             ("Добавить ролики", "Add clips"), ("Удалить выбранный ролик", "Remove selected clip"),
-            ("Переместить ролик выше", "Move clip up"), ("Переместить ролик ниже", "Move clip down")
+            ("Переместить ролик выше", "Move clip up"), ("Переместить ролик ниже", "Move clip down"),
+            ("Громкость ролика", "Clip volume"), ("Применить ко всем", "Apply to all"),
+            ("Сохранить звук…", "Save audio…"), ("Отделить звук", "Detach audio"),
+            ("Параллельный звук", "Parallel audio"),
+            ("Добавить звук…", "Add audio…"), ("Удалить звук", "Remove audio"),
+            ("Позиция", "Position"), ("Громкость", "Volume"),
+            ("Сохраняю звуковую дорожку", "Saving audio track"),
+            ("Звуковая дорожка сохранена", "Audio track saved")
         ]
     }
 
@@ -548,8 +1053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func applyLanguage() {
         configureMenu()
         modeControl.setLabel(text("Сжатие", "Compress"), forSegment: EditorMode.compress.rawValue)
-        modeControl.setLabel(text("Вырезать", "Cut"), forSegment: EditorMode.cut.rawValue)
-        modeControl.setLabel(text("Склейка", "Join"), forSegment: EditorMode.join.rawValue)
+        modeControl.setLabel(text("Редактор", "Editor"), forSegment: EditorMode.join.rawValue)
 
         if let contentView = window?.contentView {
             for view in descendants(of: contentView) {
@@ -574,6 +1078,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         sdrRadio.title = text("SDR 8-бит", "SDR 8-bit")
         sdrRadio.toolTip = text("Преобразовать HDR в совместимый SDR с tone mapping", "Convert HDR to compatible SDR with tone mapping")
         timelineView.toolTip = text("Перетащите границы или весь выбранный фрагмент", "Drag either edge or the entire selected range")
+        audioTimelineView.emptyTitle = text("Добавьте или выберите аудиодорожку", "Add or select an audio track")
+        audioTimelineView.toolTip = text(
+            "Перетаскивайте дорожку влево и вправо; тяните края для обрезки звука",
+            "Drag the track left or right; drag its edges to trim audio"
+        )
         revealButton.title = text("Показать", "Show")
         revealButton.image = NSImage(systemSymbolName: "folder", accessibilityDescription: text("Показать в Finder", "Show in Finder"))
         startButton.title = process?.isRunning == true ? text("Остановить", "Stop") : text("Старт", "Start")
@@ -628,8 +1137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         modeControl.selectedSegment = EditorMode.compress.rawValue
         modeControl.setLabel(text("Сжатие", "Compress"), forSegment: EditorMode.compress.rawValue)
-        modeControl.setLabel(text("Вырезать", "Cut"), forSegment: EditorMode.cut.rawValue)
-        modeControl.setLabel(text("Склейка", "Join"), forSegment: EditorMode.join.rawValue)
+        modeControl.setLabel(text("Редактор", "Editor"), forSegment: EditorMode.join.rawValue)
         modeControl.target = self
         modeControl.action = #selector(modeChanged(_:))
         modeControl.controlSize = .large
@@ -761,13 +1269,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinButtons.alignment = .centerY
         joinButtons.spacing = 7
 
-        joinStack = NSStackView(views: [joinScroll, joinButtons])
+        clipVolumeSlider.target = self
+        clipVolumeSlider.action = #selector(clipVolumeChanged(_:))
+        clipVolumeSlider.isContinuous = true
+        clipVolumeSlider.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        clipVolumeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        clipVolumeLabel.alignment = .right
+        clipVolumeLabel.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        let applyVolumeButton = NSButton(title: text("Применить ко всем", "Apply to all"), target: self, action: #selector(applyClipVolumeToAll(_:)))
+        let saveAudioButton = NSButton(title: text("Сохранить звук…", "Save audio…"), target: self, action: #selector(saveSelectedClipAudio(_:)))
+        let detachAudioButton = NSButton(title: text("Отделить звук", "Detach audio"), target: self, action: #selector(detachSelectedClipAudio(_:)))
+        let clipVolumeControls = NSStackView(views: [
+            NSTextField(labelWithString: text("Громкость ролика", "Clip volume")),
+            clipVolumeSlider,
+            clipVolumeLabel
+        ])
+        clipVolumeControls.orientation = .horizontal
+        clipVolumeControls.alignment = .centerY
+        clipVolumeControls.spacing = 8
+        let clipActionRow = NSStackView(views: [applyVolumeButton, detachAudioButton, saveAudioButton])
+        clipActionRow.orientation = .horizontal
+        clipActionRow.alignment = .centerY
+        clipActionRow.spacing = 8
+        let clipVolumeRow = NSStackView(views: [clipVolumeControls, clipActionRow])
+        clipVolumeRow.orientation = .vertical
+        clipVolumeRow.alignment = .leading
+        clipVolumeRow.spacing = 6
+
+        let audioColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("overlayAudio"))
+        audioColumn.resizingMask = .autoresizingMask
+        overlayAudioTable.addTableColumn(audioColumn)
+        overlayAudioTable.headerView = nil
+        overlayAudioTable.rowHeight = 28
+        overlayAudioTable.usesAlternatingRowBackgroundColors = true
+        overlayAudioTable.allowsMultipleSelection = false
+        overlayAudioTable.dataSource = self
+        overlayAudioTable.delegate = self
+        overlayAudioTable.action = #selector(overlayAudioSelectionChanged(_:))
+        let audioScroll = NSScrollView()
+        audioScroll.hasVerticalScroller = true
+        audioScroll.autohidesScrollers = true
+        audioScroll.borderType = .bezelBorder
+        audioScroll.documentView = overlayAudioTable
+        audioScroll.heightAnchor.constraint(equalToConstant: 62).isActive = true
+
+        let addAudioButton = NSButton(title: text("Добавить звук…", "Add audio…"), target: self, action: #selector(addOverlayAudio(_:)))
+        let removeAudioButton = NSButton(title: text("Удалить звук", "Remove audio"), target: self, action: #selector(removeOverlayAudio(_:)))
+        joinEditButtons += [applyVolumeButton, detachAudioButton, saveAudioButton, addAudioButton, removeAudioButton]
+        let audioHeader = NSStackView(views: [
+            NSTextField(labelWithString: text("Параллельный звук", "Parallel audio")),
+            addAudioButton,
+            removeAudioButton
+        ])
+        audioHeader.orientation = .horizontal
+        audioHeader.alignment = .centerY
+        audioHeader.spacing = 8
+
+        for field in [overlayPositionField, overlayStartField, overlayEndField] {
+            field.controlSize = .small
+            field.widthAnchor.constraint(equalToConstant: 82).isActive = true
+            field.delegate = self
+            field.target = self
+            field.action = #selector(overlayAudioFieldsChanged(_:))
+        }
+        overlayPositionField.placeholderString = "0:00"
+        overlayStartField.placeholderString = "0:00"
+        overlayEndField.placeholderString = "1:00"
+        overlayVolumeSlider.target = self
+        overlayVolumeSlider.action = #selector(overlayVolumeChanged(_:))
+        overlayVolumeSlider.isContinuous = true
+        overlayVolumeSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        overlayVolumeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        overlayVolumeLabel.alignment = .right
+        overlayVolumeLabel.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        let audioTimingRow = NSStackView(views: [
+            NSTextField(labelWithString: text("Позиция", "Position")), overlayPositionField,
+            NSTextField(labelWithString: text("Старт", "Start")), overlayStartField,
+            NSTextField(labelWithString: text("Конец", "End")), overlayEndField
+        ])
+        audioTimingRow.orientation = .horizontal
+        audioTimingRow.alignment = .centerY
+        audioTimingRow.spacing = 6
+        let audioVolumeRow = NSStackView(views: [
+            NSTextField(labelWithString: text("Громкость", "Volume")), overlayVolumeSlider, overlayVolumeLabel
+        ])
+        audioVolumeRow.orientation = .horizontal
+        audioVolumeRow.alignment = .centerY
+        audioVolumeRow.spacing = 6
+        let audioControls = NSStackView(views: [audioTimingRow, audioVolumeRow])
+        audioControls.orientation = .vertical
+        audioControls.alignment = .leading
+        audioControls.spacing = 6
+
+        joinStack = NSStackView(views: [joinScroll, joinButtons, clipVolumeRow, audioHeader, audioControls])
         joinStack.orientation = .vertical
         joinStack.alignment = .leading
         joinStack.spacing = 7
         joinStack.isHidden = true
         joinScroll.widthAnchor.constraint(equalTo: joinStack.widthAnchor).isActive = true
         joinButtons.widthAnchor.constraint(equalTo: joinStack.widthAnchor).isActive = true
+        updateJoinAudioControls()
 
         playerView.controlsStyle = .inline
         playerView.videoGravity = .resizeAspect
@@ -783,15 +1384,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             self?.timelineChanged(lower: lower, upper: upper, previewTime: previewTime)
         }
 
+        audioTimelineView.toolTip = text(
+            "Перетаскивайте дорожку влево и вправо; тяните края для обрезки звука",
+            "Drag the track left or right; drag its edges to trim audio"
+        )
+        audioTimelineView.emptyTitle = text("Добавьте или выберите аудиодорожку", "Add or select an audio track")
+        audioTimelineView.heightAnchor.constraint(equalToConstant: 68).isActive = true
+        audioTimelineView.onChange = { [weak self] position, sourceStart, sourceEnd in
+            self?.audioTimelineChanged(position: position, sourceStart: sourceStart, sourceEnd: sourceEnd)
+        }
+        editorTimelineView.heightAnchor.constraint(equalToConstant: 223).isActive = true
+        editorTimelineView.onSelectVideo = { [weak self] index in self?.selectVideoFromEditorTimeline(index) }
+        editorTimelineView.onSelectAudio = { [weak self] id in self?.selectAudioFromEditorTimeline(id) }
+        editorTimelineView.onTrimVideo = { [weak self] index, start, end in self?.trimVideoFromEditorTimeline(index: index, start: start, end: end) }
+        editorTimelineView.onReorderVideo = { [weak self] source, destination in self?.reorderVideoFromEditorTimeline(source: source, destination: destination) }
+        editorTimelineView.onChangeAudio = { [weak self] id, position, start, end in self?.changeAudioFromEditorTimeline(id: id, position: position, start: start, end: end) }
+        editorTimelineView.onSeek = { [weak self] time in self?.seekFromEditorTimeline(time) }
+        editorTimelineView.onContextMenu = { [weak self] target, projectTime in
+            self?.editorContextMenu(for: target, projectTime: projectTime)
+        }
+
         selectionLabel.textColor = .secondaryLabelColor
         selectionLabel.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .regular)
         selectionLabel.alignment = .right
-        previewStack = NSStackView(views: [playerView, timelineView, selectionLabel])
+        let editorControlsStack = NSStackView(views: [fileRow, profileRow, cpuRow, joinStack, cutRow])
+        editorControlsStack.orientation = .vertical
+        editorControlsStack.alignment = .leading
+        editorControlsStack.spacing = 13
+        for view in [fileRow, profileRow!, cpuRow, joinStack!, cutRow!] {
+            view.widthAnchor.constraint(equalTo: editorControlsStack.widthAnchor).isActive = true
+        }
+        workspaceRow = NSStackView(views: [editorControlsStack, playerView])
+        workspaceRow.orientation = .horizontal
+        workspaceRow.alignment = .top
+        workspaceRow.spacing = 24
+        workspaceColumnsConstraint = playerView.widthAnchor.constraint(equalTo: editorControlsStack.widthAnchor)
+        workspaceColumnsConstraint.isActive = false
+        playerView.isHidden = true
+
+        previewStack = NSStackView(views: [editorTimelineView, selectionLabel])
         previewStack.orientation = .vertical
         previewStack.alignment = .leading
         previewStack.spacing = 8
         previewStack.isHidden = true
-        for view in [playerView, timelineView, selectionLabel] {
+        for view in [editorTimelineView, selectionLabel] {
             view.widthAnchor.constraint(equalTo: previewStack.widthAnchor).isActive = true
         }
 
@@ -853,11 +1489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         let mainStack = NSStackView(views: [
             header,
-            fileRow,
-            profileRow,
-            cpuRow,
-            joinStack,
-            cutRow,
+            workspaceRow,
             previewStack,
             separator,
             statusRow,
@@ -872,7 +1504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         mainStack.alignment = .leading
         mainStack.spacing = 13
         mainStack.setCustomSpacing(20, after: header)
-        mainStack.setCustomSpacing(18, after: cutRow)
+        mainStack.setCustomSpacing(18, after: workspaceRow)
         mainStack.setCustomSpacing(18, after: sizeLabel)
         let scrollDocument = ScrollDocumentView()
         scrollDocument.translatesAutoresizingMaskIntoConstraints = false
@@ -892,7 +1524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         buttonRow.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(buttonRow)
 
-        for view in [header, fileRow, profileRow!, cpuRow, joinStack!, cutRow!, previewStack!, separator, statusRow,
+        for view in [header, workspaceRow!, previewStack!, separator, statusRow,
                      progressBar, detailLabel, resourceLabel, sizeLabel, technicalLabel] {
             view.widthAnchor.constraint(equalTo: mainStack.widthAnchor).isActive = true
         }
@@ -931,16 +1563,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func createDiagnosticSnapshotIfRequested() {
         guard let path = ProcessInfo.processInfo.environment["VIDEO_EDITOR_SNAPSHOT"] else { return }
         let snapshotMode = ProcessInfo.processInfo.environment["VIDEO_EDITOR_SNAPSHOT_MODE"]
-        if snapshotMode == "cut" {
-            modeControl.selectedSegment = EditorMode.cut.rawValue
-            modeChanged(modeControl)
-        } else if snapshotMode == "join" {
+        if snapshotMode == "cut" || snapshotMode == "join" {
             modeControl.selectedSegment = EditorMode.join.rawValue
             modeChanged(modeControl)
         }
         if let input = ProcessInfo.processInfo.environment["VIDEO_EDITOR_SNAPSHOT_INPUT"] {
             let url = URL(fileURLWithPath: input)
-            if snapshotMode == "join" {
+            if snapshotMode == "join" || snapshotMode == "cut" {
                 addJoinURLs([url, url, url])
             } else {
                 selectInput(url)
@@ -1084,12 +1713,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func makeIconButton(symbol: String, toolTip: String, action: Selector) -> NSButton {
         let button = NSButton()
+        button.title = ""
         button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: toolTip)
-        button.bezelStyle = .rounded
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.bezelStyle = .texturedRounded
+        button.setButtonType(.momentaryPushIn)
         button.toolTip = toolTip
         button.target = self
         button.action = action
-        button.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 32),
+            button.heightAnchor.constraint(equalToConstant: 28)
+        ])
         return button
     }
 
@@ -1140,6 +1777,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinStack.isHidden = !joining
         cutRow.isHidden = !editing
         previewStack.isHidden = !editing
+        playerView.isHidden = !editing
+        workspaceColumnsConstraint.isActive = editing
         browseButton.title = joining ? text("Добавить…", "Add…") : text("Обзор…", "Browse…")
         resourceLabel.isHidden = true
         sizeLabel.isHidden = true
@@ -1159,7 +1798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             } else {
                 clearPreview()
                 fileField.stringValue = text("Ролики не выбраны", "No clips selected")
-                statusLabel.stringValue = text("Добавьте минимум два ролика", "Add at least two clips")
+                statusLabel.stringValue = text("Добавьте ролик", "Add a clip")
                 startButton.isEnabled = false
             }
             return
@@ -1188,27 +1827,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func resizeWindow(for mode: EditorMode, animated: Bool = true) {
         let desiredHeight: CGFloat
+        let desiredWidth: CGFloat
         let targetMinSize: NSSize
         switch mode {
         case .compress:
             desiredHeight = 470
+            desiredWidth = 720
             targetMinSize = NSSize(width: 600, height: 420)
             playerHeightConstraint.constant = 240
         case .cut:
             desiredHeight = 760
+            desiredWidth = 1180
             targetMinSize = NSSize(width: 620, height: 500)
             playerHeightConstraint.constant = 240
         case .join:
-            desiredHeight = 790
-            targetMinSize = NSSize(width: 620, height: 500)
-            playerHeightConstraint.constant = 170
+            desiredHeight = 840
+            desiredWidth = 1420
+            targetMinSize = NSSize(width: 960, height: 620)
+            playerHeightConstraint.constant = 390
         }
 
         let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame
         let availableHeight = visibleFrame.map { max(420, $0.height - 16) } ?? desiredHeight
         let availableWidth = visibleFrame.map { max(500, $0.width - 16) } ?? window.frame.width
         let targetHeight = min(desiredHeight, availableHeight)
-        let targetWidth = min(max(window.frame.width, targetMinSize.width), availableWidth)
+        let targetWidth = min(max(desiredWidth, targetMinSize.width), availableWidth)
         window.minSize = NSSize(
             width: min(targetMinSize.width, targetWidth),
             height: min(targetMinSize.height, targetHeight)
@@ -1286,7 +1929,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                     info: info,
                     lowerValue: 0,
                     upperValue: info.duration,
-                    thumbnails: []
+                    thumbnails: [],
+                    volume: 1,
+                    waveform: info.hasAudio ? self.generateAudioWaveform(url) : []
                 )
             }
             DispatchQueue.main.async {
@@ -1318,14 +1963,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             selectedInputURL = joinClips.first?.url
             window.representedURL = joinClips.first?.url
         }
+        updateJoinAudioControls()
         updateStartButtonAvailability()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        joinClips.count
+        tableView === overlayAudioTable ? overlayAudioTracks.count : joinClips.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView === overlayAudioTable {
+            guard overlayAudioTracks.indices.contains(row) else { return nil }
+            let identifier = NSUserInterfaceItemIdentifier("overlayAudioCell")
+            let field = (tableView.makeView(withIdentifier: identifier, owner: self) as? NSTextField) ?? {
+                let value = NSTextField(labelWithString: "")
+                value.identifier = identifier
+                value.lineBreakMode = .byTruncatingMiddle
+                value.font = .systemFont(ofSize: 12.5)
+                return value
+            }()
+            let track = overlayAudioTracks[row]
+            field.stringValue = "\(track.url.lastPathComponent)    @ \(formatEditorTime(track.timelineStart))    \(Int((track.volume * 100).rounded()))%"
+            field.toolTip = track.url.path
+            return field
+        }
         guard joinClips.indices.contains(row) else { return nil }
         let identifier = NSUserInterfaceItemIdentifier("joinClipCell")
         let field: NSTextField
@@ -1338,19 +1999,357 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             field.font = .systemFont(ofSize: 13)
         }
         let clip = joinClips[row]
-        field.stringValue = "\(row + 1).  \(clip.url.lastPathComponent)    \(formatEditorTime(clip.lowerValue))–\(formatEditorTime(clip.upperValue))"
+        field.stringValue = "\(row + 1).  \(clip.url.lastPathComponent)    \(formatEditorTime(clip.lowerValue))–\(formatEditorTime(clip.upperValue))    \(Int((clip.volume * 100).rounded()))%"
         field.toolTip = clip.url.path
         return field
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
+        if let table = notification.object as? NSTableView, table === overlayAudioTable {
+            updateJoinAudioControls()
+            return
+        }
         guard mode == .join, joinClips.indices.contains(joinTable.selectedRow) else { return }
         prepareJoinPreview(at: joinTable.selectedRow)
+        updateJoinAudioControls()
     }
 
     @objc private func joinSelectionChanged(_ sender: NSTableView) {
         guard joinClips.indices.contains(sender.selectedRow) else { return }
         prepareJoinPreview(at: sender.selectedRow)
+        updateJoinAudioControls()
+    }
+
+    @objc private func clipVolumeChanged(_ sender: NSSlider) {
+        guard joinClips.indices.contains(joinTable.selectedRow) else { return }
+        joinClips[joinTable.selectedRow].volume = sender.doubleValue
+        clipVolumeLabel.stringValue = "\(Int((sender.doubleValue * 100).rounded()))%"
+        joinTable.reloadData(forRowIndexes: IndexSet(integer: joinTable.selectedRow), columnIndexes: IndexSet(integer: 0))
+        refreshEditorTimeline()
+        scheduleJoinPreviewAudioRefresh()
+    }
+
+    @objc private func applyClipVolumeToAll(_ sender: Any?) {
+        let value = clipVolumeSlider.doubleValue
+        for index in joinClips.indices { joinClips[index].volume = value }
+        joinTable.reloadData()
+        refreshEditorTimeline()
+        scheduleJoinPreviewAudioRefresh()
+    }
+
+    @objc private func detachSelectedClipAudio(_ sender: Any?) {
+        let row = joinTable.selectedRow
+        guard joinClips.indices.contains(row) else { return }
+        guard joinClips[row].info.hasAudio else {
+            showError(
+                title: text("В ролике нет звука", "Clip has no audio"),
+                message: text("Выбранный ролик не содержит аудиодорожку.", "The selected clip does not contain an audio track.")
+            )
+            return
+        }
+        let clip = joinClips[row]
+        let position = joinClips[..<row].reduce(0) { $0 + max(0, $1.upperValue - $1.lowerValue) }
+        joinClips[row].volume = 0
+        clipVolumeSlider.doubleValue = 0
+        clipVolumeLabel.stringValue = "0%"
+        joinTable.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
+        refreshEditorTimeline()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let waveform = self.generateAudioWaveform(clip.url)
+            DispatchQueue.main.async {
+                let detached = OverlayAudio(
+                    id: UUID(), url: clip.url, duration: clip.info.duration,
+                    sourceStart: clip.lowerValue, sourceEnd: clip.upperValue,
+                    timelineStart: position, volume: 1, waveform: waveform
+                )
+                self.overlayAudioTracks.append(detached)
+                self.overlayAudioTable.reloadData()
+                self.overlayAudioTable.selectRowIndexes(
+                    IndexSet(integer: self.overlayAudioTracks.count - 1),
+                    byExtendingSelection: false
+                )
+                self.updateJoinAudioControls()
+                self.refreshEditorTimeline()
+                self.scheduleJoinPreviewAudioRefresh(immediately: true)
+            }
+        }
+    }
+
+    @objc private func saveSelectedClipAudio(_ sender: Any?) {
+        let row = joinTable.selectedRow
+        guard joinClips.indices.contains(row), let ffmpeg = locateTool(named: "ffmpeg") else { return }
+        let clip = joinClips[row]
+        let panel = NSSavePanel()
+        panel.title = text("Сохранить звуковую дорожку", "Save audio track")
+        panel.prompt = text("Сохранить", "Save")
+        panel.directoryURL = clip.url.deletingLastPathComponent()
+        panel.nameFieldStringValue = "\(clip.url.deletingPathExtension().lastPathComponent).audio.m4a"
+        panel.allowedContentTypes = contentTypes(for: ["m4a", "mp3", "wav", "flac"])
+        panel.allowsOtherFileTypes = false
+        guard panel.runModal() == .OK, let output = panel.url else { return }
+
+        let codecArguments: [String]
+        switch output.pathExtension.lowercased() {
+        case "mp3": codecArguments = ["-c:a", "libmp3lame", "-b:a", "192k"]
+        case "wav": codecArguments = ["-c:a", "pcm_s16le"]
+        case "flac": codecArguments = ["-c:a", "flac"]
+        default: codecArguments = ["-c:a", "aac", "-b:a", "192k"]
+        }
+        let task = Process()
+        task.executableURL = ffmpeg
+        task.arguments = [
+            "-hide_banner", "-y", "-nostdin", "-ss", String(format: "%.6f", clip.lowerValue),
+            "-i", clip.url.path, "-t", String(format: "%.6f", clip.upperValue - clip.lowerValue),
+            "-map", "0:a:0", "-vn"
+        ] + codecArguments + [output.path]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        process = task
+        selectedOutputURL = nil
+        statusLabel.stringValue = text("Сохраняю звуковую дорожку", "Saving audio track")
+        progressBar.isIndeterminate = true
+        progressBar.startAnimation(nil)
+        task.terminationHandler = { [weak self] finished in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.process = nil
+                self.progressBar.stopAnimation(nil)
+                self.progressBar.isIndeterminate = false
+                self.setRunning(false)
+                if finished.terminationStatus == 0 {
+                    self.selectedOutputURL = output
+                    self.statusLabel.stringValue = self.text("Звуковая дорожка сохранена", "Audio track saved")
+                    self.revealButton.isHidden = false
+                } else {
+                    self.showError(
+                        title: self.text("Не удалось сохранить звук", "Could not save audio"),
+                        message: self.text("Проверьте, что в выбранном ролике есть звуковая дорожка.", "Make sure the selected clip contains an audio track.")
+                    )
+                }
+            }
+        }
+        do {
+            try task.run()
+            setRunning(true)
+        } catch {
+            process = nil
+            progressBar.stopAnimation(nil)
+            progressBar.isIndeterminate = false
+            setRunning(false)
+            showError(title: text("Не удалось запустить FFmpeg", "Could not start FFmpeg"), message: error.localizedDescription)
+        }
+    }
+
+    @objc private func addOverlayAudio(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.title = text("Выберите аудиофайлы", "Select audio files")
+        panel.prompt = text("Добавить", "Add")
+        panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = contentTypes(for: audioInputExtensions + videoInputExtensions)
+        panel.allowsOtherFileTypes = false
+        guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        let availableProjectDuration = joinClips.reduce(0) {
+            $0 + max(0, $1.upperValue - $1.lowerValue)
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let tracks = urls.compactMap { url -> OverlayAudio? in
+                guard let duration = self.probeMediaDuration(url), duration > 0 else { return nil }
+                let initialEnd = availableProjectDuration > 0 ? min(duration, availableProjectDuration) : duration
+                return OverlayAudio(
+                    id: UUID(), url: url, duration: duration, sourceStart: 0,
+                    sourceEnd: initialEnd, timelineStart: 0, volume: 1,
+                    waveform: self.generateAudioWaveform(url)
+                )
+            }
+            DispatchQueue.main.async {
+                let first = self.overlayAudioTracks.count
+                self.overlayAudioTracks.append(contentsOf: tracks)
+                self.overlayAudioTable.reloadData()
+                if !tracks.isEmpty {
+                    self.overlayAudioTable.selectRowIndexes(IndexSet(integer: first), byExtendingSelection: false)
+                }
+                self.updateJoinAudioControls()
+                self.scheduleJoinPreviewAudioRefresh(immediately: true)
+            }
+        }
+    }
+
+    @objc private func removeOverlayAudio(_ sender: Any?) {
+        let row = overlayAudioTable.selectedRow
+        guard overlayAudioTracks.indices.contains(row) else { return }
+        overlayAudioTracks.remove(at: row)
+        overlayAudioTable.reloadData()
+        if !overlayAudioTracks.isEmpty {
+            overlayAudioTable.selectRowIndexes(IndexSet(integer: min(row, overlayAudioTracks.count - 1)), byExtendingSelection: false)
+        }
+        updateJoinAudioControls()
+        scheduleJoinPreviewAudioRefresh(immediately: true)
+    }
+
+    @objc private func overlayAudioSelectionChanged(_ sender: NSTableView) {
+        updateJoinAudioControls()
+    }
+
+    @objc private func overlayVolumeChanged(_ sender: NSSlider) {
+        guard overlayAudioTracks.indices.contains(overlayAudioTable.selectedRow) else { return }
+        overlayAudioTracks[overlayAudioTable.selectedRow].volume = sender.doubleValue
+        overlayVolumeLabel.stringValue = "\(Int((sender.doubleValue * 100).rounded()))%"
+        overlayAudioTable.reloadData(forRowIndexes: IndexSet(integer: overlayAudioTable.selectedRow), columnIndexes: IndexSet(integer: 0))
+        scheduleJoinPreviewAudioRefresh()
+    }
+
+    @objc private func overlayAudioFieldsChanged(_ sender: Any?) {
+        let row = overlayAudioTable.selectedRow
+        guard overlayAudioTracks.indices.contains(row),
+              let position = parseTime(overlayPositionField.stringValue),
+              let start = parseTime(overlayStartField.stringValue),
+              let end = parseTime(overlayEndField.stringValue),
+              position >= 0, start >= 0, end > start, end <= overlayAudioTracks[row].duration + 0.001 else {
+            NSSound.beep()
+            updateJoinAudioControls()
+            return
+        }
+        overlayAudioTracks[row].timelineStart = position
+        overlayAudioTracks[row].sourceStart = start
+        overlayAudioTracks[row].sourceEnd = end
+        overlayAudioTable.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
+        scheduleJoinPreviewAudioRefresh(immediately: true)
+    }
+
+    private func audioTimelineChanged(position: Double, sourceStart: Double, sourceEnd: Double) {
+        let row = overlayAudioTable.selectedRow
+        guard overlayAudioTracks.indices.contains(row) else { return }
+        overlayAudioTracks[row].timelineStart = position
+        overlayAudioTracks[row].sourceStart = sourceStart
+        overlayAudioTracks[row].sourceEnd = sourceEnd
+        overlayPositionField.stringValue = formatEditorTime(position)
+        overlayStartField.stringValue = formatEditorTime(sourceStart)
+        overlayEndField.stringValue = formatEditorTime(sourceEnd)
+        overlayAudioTable.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
+        scheduleJoinPreviewAudioRefresh()
+    }
+
+    private func updateJoinAudioControls() {
+        let clipSelected = joinClips.indices.contains(joinTable.selectedRow)
+        clipVolumeSlider.isEnabled = clipSelected && process?.isRunning != true
+        if clipSelected {
+            clipVolumeSlider.doubleValue = joinClips[joinTable.selectedRow].volume
+            clipVolumeLabel.stringValue = "\(Int((clipVolumeSlider.doubleValue * 100).rounded()))%"
+        }
+        let audioSelected = overlayAudioTracks.indices.contains(overlayAudioTable.selectedRow)
+        for control in [overlayPositionField, overlayStartField, overlayEndField] {
+            control.isEnabled = audioSelected && process?.isRunning != true
+        }
+        overlayVolumeSlider.isEnabled = audioSelected && process?.isRunning != true
+        if audioSelected {
+            let track = overlayAudioTracks[overlayAudioTable.selectedRow]
+            overlayPositionField.stringValue = formatEditorTime(track.timelineStart)
+            overlayStartField.stringValue = formatEditorTime(track.sourceStart)
+            overlayEndField.stringValue = formatEditorTime(track.sourceEnd)
+            overlayVolumeSlider.doubleValue = track.volume
+            overlayVolumeLabel.stringValue = "\(Int((track.volume * 100).rounded()))%"
+            audioTimelineView.projectDuration = max(0.001, joinClips.reduce(0) {
+                $0 + max(0, $1.upperValue - $1.lowerValue)
+            })
+            audioTimelineView.timelineStart = track.timelineStart
+            audioTimelineView.sourceStart = track.sourceStart
+            audioTimelineView.sourceEnd = track.sourceEnd
+            audioTimelineView.sourceDuration = track.duration
+            audioTimelineView.waveform = track.waveform
+            audioTimelineView.trackTitle = track.url.lastPathComponent
+            audioTimelineView.isEnabled = process?.isRunning != true
+        } else {
+            overlayPositionField.stringValue = ""
+            overlayStartField.stringValue = ""
+            overlayEndField.stringValue = ""
+            overlayVolumeLabel.stringValue = "—"
+            audioTimelineView.sourceDuration = 0
+            audioTimelineView.waveform = []
+            audioTimelineView.trackTitle = ""
+            audioTimelineView.isEnabled = false
+        }
+        refreshEditorTimeline()
+    }
+
+    private func refreshEditorTimeline() {
+        editorTimelineView.videos = joinClips.map {
+            EditorVideoTimelineItem(
+                id: $0.id, title: $0.url.lastPathComponent,
+                sourceDuration: $0.info.duration, sourceStart: $0.lowerValue, sourceEnd: $0.upperValue,
+                thumbnails: $0.thumbnails, hasLinkedAudio: $0.info.hasAudio,
+                volume: $0.volume, linkedWaveform: $0.waveform
+            )
+        }
+        editorTimelineView.audios = overlayAudioTracks.map {
+            EditorAudioTimelineItem(
+                id: $0.id, title: $0.url.lastPathComponent,
+                sourceDuration: $0.duration, sourceStart: $0.sourceStart, sourceEnd: $0.sourceEnd,
+                timelineStart: $0.timelineStart, waveform: $0.waveform
+            )
+        }
+        editorTimelineView.selectedVideoID = joinClips.indices.contains(joinTable.selectedRow)
+            ? joinClips[joinTable.selectedRow].id : nil
+        editorTimelineView.selectedAudioID = overlayAudioTracks.indices.contains(overlayAudioTable.selectedRow)
+            ? overlayAudioTracks[overlayAudioTable.selectedRow].id : nil
+        editorTimelineView.isEnabled = process?.isRunning != true && !joinClips.isEmpty
+    }
+
+    private func selectVideoFromEditorTimeline(_ index: Int) {
+        guard joinClips.indices.contains(index) else { return }
+        joinTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        prepareJoinPreview(at: index)
+        updateJoinAudioControls()
+    }
+
+    private func selectAudioFromEditorTimeline(_ id: UUID) {
+        guard let index = overlayAudioTracks.firstIndex(where: { $0.id == id }) else { return }
+        overlayAudioTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        updateJoinAudioControls()
+    }
+
+    private func trimVideoFromEditorTimeline(index: Int, start: Double, end: Double) {
+        guard joinClips.indices.contains(index), end > start else { return }
+        joinClips[index].lowerValue = start
+        joinClips[index].upperValue = end
+        if joinTable.selectedRow == index {
+            timelineView.lowerValue = start
+            timelineView.upperValue = end
+            startField.stringValue = formatEditorTime(start)
+            endField.stringValue = formatEditorTime(end)
+            updateSelectionLabel()
+        }
+        joinTable.reloadData(forRowIndexes: IndexSet(integer: index), columnIndexes: IndexSet(integer: 0))
+        refreshEditorTimeline()
+        scheduleJoinPreviewAudioRefresh()
+        updateStartButtonAvailability()
+    }
+
+    private func reorderVideoFromEditorTimeline(source: Int, destination: Int) {
+        guard joinClips.indices.contains(source), joinClips.indices.contains(destination), source != destination else { return }
+        let clip = joinClips.remove(at: source)
+        joinClips.insert(clip, at: destination)
+        joinTable.reloadData()
+        joinTable.selectRowIndexes(IndexSet(integer: destination), byExtendingSelection: false)
+        prepareJoinPreview(at: destination)
+        updateJoinFileSummary()
+    }
+
+    private func changeAudioFromEditorTimeline(id: UUID, position: Double, start: Double, end: Double) {
+        guard let index = overlayAudioTracks.firstIndex(where: { $0.id == id }), end > start else { return }
+        overlayAudioTracks[index].timelineStart = position
+        overlayAudioTracks[index].sourceStart = start
+        overlayAudioTracks[index].sourceEnd = end
+        if overlayAudioTable.selectedRow != index {
+            overlayAudioTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        }
+        overlayAudioTable.reloadData(forRowIndexes: IndexSet(integer: index), columnIndexes: IndexSet(integer: 0))
+        updateJoinAudioControls()
+        scheduleJoinPreviewAudioRefresh()
     }
 
     @objc private func removeJoinClip(_ sender: Any?) {
@@ -1360,9 +2359,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinClips.remove(at: row)
         joinTable.reloadData()
         updateJoinFileSummary()
+        updateJoinAudioControls()
         guard !joinClips.isEmpty else {
             clearPreview()
-            statusLabel.stringValue = text("Добавьте минимум два ролика", "Add at least two clips")
+            statusLabel.stringValue = text("Добавьте ролик", "Add a clip")
             return
         }
         let nextRow = min(row, joinClips.count - 1)
@@ -1387,6 +2387,154 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinTable.reloadData()
         joinTable.selectRowIndexes(IndexSet(integer: destination), byExtendingSelection: false)
         updateJoinFileSummary()
+    }
+
+    private func editorContextMenu(for target: EditorTimelineContextTarget, projectTime: Double) -> NSMenu? {
+        guard process?.isRunning != true else { return nil }
+        timelineContextTarget = target
+        timelineContextProjectTime = projectTime
+        let menu = NSMenu()
+        switch target {
+        case .video:
+            addEditorMenuItem(menu, text("Разрезать видео здесь", "Split video here"), "splitVideo")
+            addEditorMenuItem(menu, text("Отделить звук", "Detach audio"), "detachAudio")
+            addEditorMenuItem(menu, text("Сохранить звук…", "Save audio…"), "saveAudio")
+            menu.addItem(.separator())
+            addEditorMenuItem(menu, text("Сделать звук видео тише (−10%)", "Lower video audio (−10%)"), "lowerClipAudio")
+            addEditorMenuItem(menu, text("Сделать звук видео громче (+10%)", "Raise video audio (+10%)"), "raiseClipAudio")
+            addEditorMenuItem(menu, text("Убрать звук видео", "Mute video audio"), "muteClipAudio")
+            addEditorMenuItem(menu, text("Вернуть громкость 100%", "Reset volume to 100%"), "resetClipAudio")
+            menu.addItem(.separator())
+            addEditorMenuItem(menu, text("Удалить видео", "Delete video"), "deleteVideo")
+        case .linkedAudio:
+            addEditorMenuItem(menu, text("Отделить звук", "Detach audio"), "detachAudio")
+            addEditorMenuItem(menu, text("Сохранить звук…", "Save audio…"), "saveAudio")
+            menu.addItem(.separator())
+            addEditorMenuItem(menu, text("Сделать тише (−10%)", "Lower volume (−10%)"), "lowerClipAudio")
+            addEditorMenuItem(menu, text("Сделать громче (+10%)", "Raise volume (+10%)"), "raiseClipAudio")
+            addEditorMenuItem(menu, text("Удалить звук", "Remove audio"), "muteClipAudio")
+            addEditorMenuItem(menu, text("Вернуть громкость 100%", "Reset volume to 100%"), "resetClipAudio")
+        case .audio:
+            addEditorMenuItem(menu, text("Сделать тише (−10%)", "Lower volume (−10%)"), "lowerAudio")
+            addEditorMenuItem(menu, text("Сделать громче (+10%)", "Raise volume (+10%)"), "raiseAudio")
+            addEditorMenuItem(menu, text("Без звука", "Mute"), "muteAudio")
+            addEditorMenuItem(menu, text("Вернуть громкость 100%", "Reset volume to 100%"), "resetAudio")
+            menu.addItem(.separator())
+            addEditorMenuItem(menu, text("Удалить аудиодорожку", "Delete audio track"), "deleteAudio")
+        }
+        return menu
+    }
+
+    private func addEditorMenuItem(_ menu: NSMenu, _ title: String, _ command: String) {
+        let item = menu.addItem(withTitle: title, action: #selector(runEditorContextCommand(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = command
+    }
+
+    @objc private func runEditorContextCommand(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? String else { return }
+        switch command {
+        case "splitVideo": splitContextVideo()
+        case "detachAudio": selectContextClip(); detachSelectedClipAudio(nil)
+        case "saveAudio": selectContextClip(); saveSelectedClipAudio(nil)
+        case "lowerClipAudio": changeContextClipVolume(by: -0.1)
+        case "raiseClipAudio": changeContextClipVolume(by: 0.1)
+        case "muteClipAudio": setContextClipVolume(0)
+        case "resetClipAudio": setContextClipVolume(1)
+        case "deleteVideo": deleteContextVideo()
+        case "lowerAudio": changeContextAudioVolume(by: -0.1)
+        case "raiseAudio": changeContextAudioVolume(by: 0.1)
+        case "muteAudio": setContextAudioVolume(0)
+        case "resetAudio": setContextAudioVolume(1)
+        case "deleteAudio": deleteContextAudio()
+        default: break
+        }
+    }
+
+    private func contextClipIndex() -> Int? {
+        switch timelineContextTarget {
+        case .video(let index), .linkedAudio(let index): return index
+        default: return nil
+        }
+    }
+
+    private func contextAudioIndex() -> Int? {
+        guard case .audio(let id) = timelineContextTarget else { return nil }
+        return overlayAudioTracks.firstIndex(where: { $0.id == id })
+    }
+
+    private func selectContextClip() {
+        guard let index = contextClipIndex(), joinClips.indices.contains(index) else { return }
+        joinTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+    }
+
+    private func splitContextVideo() {
+        guard let index = contextClipIndex(), joinClips.indices.contains(index) else { return }
+        let clip = joinClips[index]
+        let projectStart = joinClips[..<index].reduce(0) { $0 + max(0, $1.upperValue - $1.lowerValue) }
+        let splitSourceTime = clip.lowerValue + timelineContextProjectTime - projectStart
+        guard splitSourceTime > clip.lowerValue + 0.05, splitSourceTime < clip.upperValue - 0.05 else {
+            NSSound.beep()
+            return
+        }
+        let left = JoinClip(
+            id: clip.id, url: clip.url, info: clip.info,
+            lowerValue: clip.lowerValue, upperValue: splitSourceTime,
+            thumbnails: clip.thumbnails, volume: clip.volume, waveform: clip.waveform
+        )
+        let right = JoinClip(
+            id: UUID(), url: clip.url, info: clip.info,
+            lowerValue: splitSourceTime, upperValue: clip.upperValue,
+            thumbnails: clip.thumbnails, volume: clip.volume, waveform: clip.waveform
+        )
+        joinClips[index] = left
+        joinClips.insert(right, at: index + 1)
+        joinTable.reloadData()
+        joinTable.selectRowIndexes(IndexSet(integer: index + 1), byExtendingSelection: false)
+        updateJoinFileSummary()
+        prepareJoinPreview(at: index + 1)
+        updateJoinAudioControls()
+        statusLabel.stringValue = text("Видео разрезано", "Video split")
+    }
+
+    private func changeContextClipVolume(by delta: Double) {
+        guard let index = contextClipIndex(), joinClips.indices.contains(index) else { return }
+        setContextClipVolume(joinClips[index].volume + delta)
+    }
+
+    private func setContextClipVolume(_ value: Double) {
+        guard let index = contextClipIndex(), joinClips.indices.contains(index) else { return }
+        joinClips[index].volume = min(2, max(0, value))
+        joinTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        joinTable.reloadData(forRowIndexes: IndexSet(integer: index), columnIndexes: IndexSet(integer: 0))
+        updateJoinAudioControls()
+        scheduleJoinPreviewAudioRefresh(immediately: true)
+    }
+
+    private func deleteContextVideo() {
+        guard let index = contextClipIndex(), joinClips.indices.contains(index) else { return }
+        joinTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        removeJoinClip(nil)
+    }
+
+    private func changeContextAudioVolume(by delta: Double) {
+        guard let index = contextAudioIndex(), overlayAudioTracks.indices.contains(index) else { return }
+        setContextAudioVolume(overlayAudioTracks[index].volume + delta)
+    }
+
+    private func setContextAudioVolume(_ value: Double) {
+        guard let index = contextAudioIndex(), overlayAudioTracks.indices.contains(index) else { return }
+        overlayAudioTracks[index].volume = min(2, max(0, value))
+        overlayAudioTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        overlayAudioTable.reloadData(forRowIndexes: IndexSet(integer: index), columnIndexes: IndexSet(integer: 0))
+        updateJoinAudioControls()
+        scheduleJoinPreviewAudioRefresh(immediately: true)
+    }
+
+    private func deleteContextAudio() {
+        guard let index = contextAudioIndex(), overlayAudioTracks.indices.contains(index) else { return }
+        overlayAudioTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        removeOverlayAudio(nil)
     }
 
     private func clearPreview() {
@@ -1511,8 +2659,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             codec: stringValue(video["codec_name"]),
             pixelFormat: stringValue(video["pix_fmt"]),
             colorTransfer: stringValue(video["color_transfer"]),
-            duration: doubleValue(format["duration"])
+            duration: doubleValue(format["duration"]),
+            hasAudio: streams.contains { stringValue($0["codec_type"]) == "audio" }
         )
+    }
+
+    private func probeMediaDuration(_ url: URL) -> Double? {
+        guard let ffprobe = locateTool(named: "ffprobe") else { return nil }
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = ffprobe
+        task.arguments = ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url.path]
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0,
+              let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let duration = Double(raw), duration.isFinite else { return nil }
+        return duration
+    }
+
+    private func generateAudioWaveform(_ url: URL, columns: Int = 600) -> [CGFloat] {
+        guard let ffmpeg = locateTool(named: "ffmpeg") else { return [] }
+        let task = Process()
+        let pipe = Pipe()
+        task.executableURL = ffmpeg
+        task.arguments = [
+            "-v", "error", "-i", url.path, "-map", "0:a:0", "-vn",
+            "-ac", "1", "-ar", "400", "-f", "s16le", "pipe:1"
+        ]
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        guard task.terminationStatus == 0, data.count >= 2 else { return [] }
+
+        let sampleCount = data.count / 2
+        let resultCount = min(columns, sampleCount)
+        var result = Array(repeating: CGFloat(0), count: resultCount)
+        data.withUnsafeBytes { rawBuffer in
+            let bytes = rawBuffer.bindMemory(to: UInt8.self)
+            for column in 0..<resultCount {
+                let firstSample = column * sampleCount / resultCount
+                let lastSample = max(firstSample + 1, (column + 1) * sampleCount / resultCount)
+                var peak = 0
+                for sample in firstSample..<min(lastSample, sampleCount) {
+                    let offset = sample * 2
+                    let bits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+                    let value = abs(Int(Int16(bitPattern: bits)))
+                    peak = max(peak, value)
+                }
+                result[column] = CGFloat(peak) / 32768
+            }
+        }
+        let maximum = max(result.max() ?? 0, 0.001)
+        return result.map { max(0.035, CGFloat(pow(Double($0 / maximum), 0.65))) }
     }
 
     private func applyAvailableProfiles(for info: SourceInfo) {
@@ -1687,7 +2891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         previewToken = token
         removePlayerTimeObserver()
 
-        let player = AVPlayer(url: clip.url)
+        let player = AVPlayer(playerItem: makeJoinPreviewItem(at: index))
         playerView.player = player
         timelineView.duration = clip.info.duration
         timelineView.lowerValue = clip.lowerValue
@@ -1697,9 +2901,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         startField.stringValue = formatEditorTime(clip.lowerValue)
         endField.stringValue = formatEditorTime(clip.upperValue)
         updateSelectionLabel()
-        statusLabel.stringValue = joinClips.count >= 2
-            ? text("Готов к склейке", "Ready to join")
-            : text("Добавьте ещё один ролик", "Add one more clip")
+        statusLabel.stringValue = text("Готов к редактированию", "Ready to edit")
         detailLabel.stringValue = text(
             "Ролик \(index + 1) из \(joinClips.count)   •   \(clip.info.width)x\(clip.info.height)",
             "Clip \(index + 1) of \(joinClips.count)   •   \(clip.info.width)x\(clip.info.height)"
@@ -1710,11 +2912,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             toleranceBefore: .zero,
             toleranceAfter: .zero
         )
+        updateEditorPlayhead(for: index, sourceTime: clip.lowerValue)
         playerTimeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.1, preferredTimescale: 600),
             queue: .main
         ) { [weak self, weak player] time in
             guard let self, let player, player.rate > 0 else { return }
+            self.updateEditorPlayhead(for: index, sourceTime: time.seconds)
             if time.seconds >= self.timelineView.upperValue {
                 player.pause()
                 player.seek(to: CMTime(seconds: self.timelineView.lowerValue, preferredTimescale: 600))
@@ -1745,7 +2949,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 if self.joinTable.selectedRow == currentIndex {
                     self.timelineView.thumbnails = images
                 }
+                self.refreshEditorTimeline()
             }
+        }
+    }
+
+    private func makeJoinPreviewItem(at index: Int) -> AVPlayerItem {
+        guard joinClips.indices.contains(index) else {
+            return AVPlayerItem(url: URL(fileURLWithPath: "/dev/null"))
+        }
+        let clip = joinClips[index]
+        let composition = AVMutableComposition()
+        var audioParameters: [AVMutableAudioMixInputParameters] = []
+        let clipAsset = AVURLAsset(url: clip.url)
+        let fullDuration = CMTime(seconds: clip.info.duration, preferredTimescale: 600)
+        let fullRange = CMTimeRange(start: .zero, duration: fullDuration)
+
+        if let sourceVideo = clipAsset.tracks(withMediaType: .video).first,
+           let destinationVideo = composition.addMutableTrack(
+               withMediaType: .video,
+               preferredTrackID: kCMPersistentTrackID_Invalid
+           ) {
+            try? destinationVideo.insertTimeRange(fullRange, of: sourceVideo, at: .zero)
+            destinationVideo.preferredTransform = sourceVideo.preferredTransform
+        }
+        if let sourceAudio = clipAsset.tracks(withMediaType: .audio).first,
+           let destinationAudio = composition.addMutableTrack(
+               withMediaType: .audio,
+               preferredTrackID: kCMPersistentTrackID_Invalid
+           ) {
+            try? destinationAudio.insertTimeRange(fullRange, of: sourceAudio, at: .zero)
+            let parameters = AVMutableAudioMixInputParameters(track: destinationAudio)
+            parameters.setVolume(Float(clip.volume), at: .zero)
+            audioParameters.append(parameters)
+        }
+
+        let selectedGlobalStart = joinClips[..<index].reduce(0) {
+            $0 + max(0, $1.upperValue - $1.lowerValue)
+        }
+        let selectedGlobalEnd = selectedGlobalStart + max(0, clip.upperValue - clip.lowerValue)
+        for overlay in overlayAudioTracks {
+            let overlayGlobalEnd = overlay.timelineStart + max(0, overlay.sourceEnd - overlay.sourceStart)
+            let overlapStart = max(selectedGlobalStart, overlay.timelineStart)
+            let overlapEnd = min(selectedGlobalEnd, overlayGlobalEnd)
+            guard overlapEnd > overlapStart else { continue }
+
+            let sourceOffset = overlay.sourceStart + overlapStart - overlay.timelineStart
+            let destinationOffset = clip.lowerValue + overlapStart - selectedGlobalStart
+            let overlayAsset = AVURLAsset(url: overlay.url)
+            guard let sourceAudio = overlayAsset.tracks(withMediaType: .audio).first,
+                  let destinationAudio = composition.addMutableTrack(
+                      withMediaType: .audio,
+                      preferredTrackID: kCMPersistentTrackID_Invalid
+                  ) else { continue }
+            let sourceRange = CMTimeRange(
+                start: CMTime(seconds: sourceOffset, preferredTimescale: 600),
+                duration: CMTime(seconds: overlapEnd - overlapStart, preferredTimescale: 600)
+            )
+            do {
+                try destinationAudio.insertTimeRange(
+                    sourceRange,
+                    of: sourceAudio,
+                    at: CMTime(seconds: destinationOffset, preferredTimescale: 600)
+                )
+            } catch {
+                continue
+            }
+            let parameters = AVMutableAudioMixInputParameters(track: destinationAudio)
+            parameters.setVolume(Float(overlay.volume), at: .zero)
+            audioParameters.append(parameters)
+        }
+
+        let item = AVPlayerItem(asset: composition)
+        let audioMix = AVMutableAudioMix()
+        audioMix.inputParameters = audioParameters
+        item.audioMix = audioMix
+        return item
+    }
+
+    private func scheduleJoinPreviewAudioRefresh(immediately: Bool = false) {
+        previewAudioRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.refreshJoinPreviewAudio()
+        }
+        previewAudioRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + (immediately ? 0 : 0.12), execute: workItem)
+    }
+
+    private func refreshJoinPreviewAudio() {
+        guard mode == .join,
+              joinClips.indices.contains(joinTable.selectedRow),
+              let player = playerView.player else { return }
+        let time = player.currentTime()
+        let wasPlaying = player.rate > 0
+        player.replaceCurrentItem(with: makeJoinPreviewItem(at: joinTable.selectedRow))
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+            if finished && wasPlaying { player.play() }
+        }
+    }
+
+    private func updateEditorPlayhead(for index: Int, sourceTime: Double) {
+        guard joinClips.indices.contains(index) else { return }
+        let prefix = joinClips[..<index].reduce(0) { $0 + max(0, $1.upperValue - $1.lowerValue) }
+        editorTimelineView.playheadTime = prefix + max(0, sourceTime - joinClips[index].lowerValue)
+    }
+
+    private func seekFromEditorTimeline(_ projectTime: Double) {
+        var offset = 0.0
+        for index in joinClips.indices {
+            let length = max(0, joinClips[index].upperValue - joinClips[index].lowerValue)
+            if projectTime <= offset + length || index == joinClips.count - 1 {
+                if joinTable.selectedRow != index {
+                    joinTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+                    prepareJoinPreview(at: index)
+                }
+                let sourceTime = joinClips[index].lowerValue + min(length, max(0, projectTime - offset))
+                playerView.player?.seek(
+                    to: CMTime(seconds: sourceTime, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                )
+                editorTimelineView.playheadTime = projectTime
+                return
+            }
+            offset += length
         }
     }
 
@@ -1774,8 +3101,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
-        guard let field = obj.object as? NSTextField,
-              field === startField || field === endField else { return }
+        guard let field = obj.object as? NSTextField else { return }
+        if field === overlayPositionField || field === overlayStartField || field === overlayEndField {
+            overlayAudioFieldsChanged(field)
+            return
+        }
+        guard field === startField || field === endField else { return }
         applyTimeFields(seekToStart: field === startField)
     }
 
@@ -1815,6 +3146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         joinClips[row].lowerValue = lower
         joinClips[row].upperValue = upper
         joinTable.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
+        updateJoinAudioControls()
     }
 
     private func formatEditorTime(_ value: Double) -> String {
@@ -1852,10 +3184,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
                 return
             }
         } else if mode == .join {
-            guard joinClips.count >= 2 else {
+            guard !joinClips.isEmpty else {
                 showError(
-                    title: text("Недостаточно роликов", "Not enough clips"),
-                    message: text("Для склейки добавьте минимум два ролика.", "Add at least two clips to join them.")
+                    title: text("Ролик не выбран", "No clip selected"),
+                    message: text("Добавьте хотя бы один ролик в редактор.", "Add at least one clip to the editor.")
+                )
+                return
+            }
+            let joinedDuration = joinClips.reduce(0) { $0 + max(0, $1.upperValue - $1.lowerValue) }
+            guard overlayAudioTracks.allSatisfy({ $0.timelineStart < joinedDuration }) else {
+                showError(
+                    title: text("Проверьте позицию звука", "Check audio position"),
+                    message: text(
+                        "Начало каждой дополнительной аудиодорожки должно находиться внутри итогового ролика.",
+                        "Each additional audio track must start within the resulting video."
+                    )
                 )
                 return
             }
@@ -1894,6 +3237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
         guard savePanel.runModal() == .OK, var outputURL = savePanel.url else { return }
         pendingCompressionProfile = nil
+        pendingOutputColorMode = .sdr
 
         if mode == .cut || mode == .join {
             let candidates: [CompressionProfile]
@@ -1910,10 +3254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             switch askCompressionChoice(from: candidates) {
             case .cancelled:
                 return
-            case .original:
-                break
-            case .profile(let profile):
+            case .original(let colorMode):
+                pendingOutputColorMode = colorMode
+            case .profile(let profile, let colorMode):
                 pendingCompressionProfile = profile
+                pendingOutputColorMode = colorMode
                 if !compressedOutputExtensions.contains(outputURL.pathExtension.lowercased()) {
                     outputURL = outputURL.deletingPathExtension().appendingPathExtension("mp4")
                 }
@@ -1937,16 +3282,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         alert.addButton(withTitle: text("Продолжить", "Continue"))
         alert.addButton(withTitle: text("Отмена", "Cancel"))
 
-        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 390, height: 30), pullsDown: false)
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 430, height: 30), pullsDown: false)
         popup.addItem(withTitle: text("Без дополнительного сжатия", "Without additional compression"))
         popup.addItems(withTitles: candidates.map(profileTitle))
         popup.selectItem(at: 0)
-        alert.accessoryView = popup
+
+        let sourceInfos = mode == .join ? joinClips.map(\.info) : [sourceInfo].compactMap { $0 }
+        let hasHDR = sourceInfos.contains { $0.isHDR || $0.isHighBitDepth }
+        let canPreserveHDR = hasHDR && sourceInfos.allSatisfy { $0.isHDR || $0.isHighBitDepth }
+        let hdr = NSButton(radioButtonWithTitle: text("HDR 10-бит", "HDR 10-bit"), target: nil, action: nil)
+        let sdr = NSButton(radioButtonWithTitle: text("SDR 8-бит", "SDR 8-bit"), target: nil, action: nil)
+        hdr.isEnabled = canPreserveHDR
+        hdr.state = canPreserveHDR ? .on : .off
+        sdr.state = canPreserveHDR ? .off : .on
+        let colorRow = NSStackView(views: [hdr, sdr])
+        colorRow.orientation = .horizontal
+        colorRow.spacing = 18
+        let accessory = NSStackView(views: [popup, colorRow])
+        accessory.orientation = .vertical
+        accessory.alignment = .leading
+        accessory.spacing = 8
+        alert.accessoryView = accessory
 
         guard alert.runModal() == .alertFirstButtonReturn else { return .cancelled }
+        let colorMode: OutputColorMode = hdr.state == .on ? .hdr : .sdr
         let selectedIndex = popup.indexOfSelectedItem
-        guard selectedIndex > 0, candidates.indices.contains(selectedIndex - 1) else { return .original }
-        return .profile(candidates[selectedIndex - 1])
+        guard selectedIndex > 0, candidates.indices.contains(selectedIndex - 1) else { return .original(colorMode) }
+        return .profile(candidates[selectedIndex - 1], colorMode)
     }
 
     private func beginProcess(inputURL: URL, outputURL: URL) {
@@ -1982,24 +3344,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             if let profile = pendingCompressionProfile {
                 arguments = ["compress", profile.id, "-s", startField.stringValue, "-e", endField.stringValue]
                 if let sourceInfo, sourceInfo.isHDR || sourceInfo.isHighBitDepth {
-                    arguments.append(hdrRadio.state == .on ? "--preserve-hdr" : "--convert-sdr")
+                    arguments.append(pendingOutputColorMode == .hdr ? "--preserve-hdr" : "--convert-sdr")
                 }
             } else {
                 arguments = ["cut", "-s", startField.stringValue, "-e", endField.stringValue]
             }
             arguments += ["-f", inputURL.path]
         case .join:
-            guard joinClips.count >= 2 else { return }
-            let invalidPath = joinClips.first { $0.url.path.contains("\t") || $0.url.path.contains("\n") }
-            guard invalidPath == nil else {
+            guard !joinClips.isEmpty else { return }
+            let allManifestURLs = joinClips.map(\.url) + overlayAudioTracks.map(\.url)
+            guard !allManifestURLs.contains(where: { $0.path.contains("\t") || $0.path.contains("\n") }) else {
                 showError(
                     title: text("Неподдерживаемое имя файла", "Unsupported file name"),
-                    message: text("В имени ролика не должно быть табуляции или переноса строки.", "A clip name must not contain tabs or line breaks.")
+                    message: text("В имени медиафайла не должно быть табуляции или переноса строки.", "A media file name must not contain tabs or line breaks.")
                 )
                 return
             }
             let manifest = joinClips.map {
-                "\($0.url.path)\t\(formatManifestTime($0.lowerValue))\t\(formatManifestTime($0.upperValue))"
+                "\($0.url.path)\t\(formatManifestTime($0.lowerValue))\t\(formatManifestTime($0.upperValue))\t\(String(format: "%.3f", $0.volume))"
             }.joined(separator: "\n") + "\n"
             let manifestURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("video-editor-join-\(UUID().uuidString).tsv")
@@ -2011,9 +3373,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             processManifestURL = manifestURL
             arguments = ["join", "--manifest", manifestURL.path]
+            if !overlayAudioTracks.isEmpty {
+                let audioManifest = overlayAudioTracks.map {
+                    "\($0.url.path)\t\(formatManifestTime($0.sourceStart))\t\(formatManifestTime($0.sourceEnd))\t\(formatManifestTime($0.timelineStart))\t\(String(format: "%.3f", $0.volume))"
+                }.joined(separator: "\n") + "\n"
+                let audioManifestURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("video-editor-audio-\(UUID().uuidString).tsv")
+                do {
+                    try audioManifest.data(using: .utf8)?.write(to: audioManifestURL, options: .atomic)
+                } catch {
+                    showError(title: text("Не удалось подготовить звуковые дорожки", "Could not prepare audio tracks"), message: error.localizedDescription)
+                    return
+                }
+                processAudioManifestURL = audioManifestURL
+                arguments += ["--audio-manifest", audioManifestURL.path]
+            }
             if let profile = pendingCompressionProfile {
                 arguments += ["--profile", profile.id]
             }
+            arguments.append(pendingOutputColorMode == .hdr ? "--preserve-hdr" : "--convert-sdr")
             if cpuCheckbox.state == .on {
                 arguments.append("--no-gpu")
             }
@@ -2357,6 +3735,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             try? FileManager.default.removeItem(at: processManifestURL)
         }
         processManifestURL = nil
+        if let processAudioManifestURL {
+            try? FileManager.default.removeItem(at: processAudioManifestURL)
+        }
+        processAudioManifestURL = nil
     }
 
     private func setRunning(_ running: Bool) {
@@ -2370,6 +3752,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         startField.isEnabled = !running
         endField.isEnabled = !running
         joinTable.isEnabled = !running
+        overlayAudioTable.isEnabled = !running
         joinEditButtons.forEach { $0.isEnabled = !running }
         timelineView.isEnabled = !running && (mode == .cut || mode == .join) && selectedInputURL != nil
         if running {
@@ -2386,6 +3769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             updateStartButtonAvailability()
         }
         revealButton.isHidden = true
+        updateJoinAudioControls()
     }
 
     private func updateStartButtonAvailability() {
@@ -2403,7 +3787,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             startButton.isEnabled = timelineView.isEnabled && timelineView.upperValue > timelineView.lowerValue
         case .join:
-            startButton.isEnabled = joinClips.count >= 2 && joinClips.allSatisfy { $0.upperValue > $0.lowerValue }
+            startButton.isEnabled = !joinClips.isEmpty && joinClips.allSatisfy { $0.upperValue > $0.lowerValue }
         }
     }
 
