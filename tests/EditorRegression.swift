@@ -22,6 +22,40 @@ extension AppDelegate {
         precondition(parseTime("01:02:03,5") == 3723.5)
         precondition(formatEditorTime(.infinity) == "00:00.000")
         guard let info = probeSource(source) else { fatalError("Fixture could not be read") }
+        let camera = SourceInfo(width: 1920, height: 1080, fps: 60, videoBitrate: 3,
+                                codec: "h264", pixelFormat: "yuv420p", colorTransfer: "bt709", duration: 900, hasAudio: false)
+        let compact = compactProfiles.first { $0.targetShortSide == 720 }!
+        precondition(isProfileAvailable(compact, for: camera))
+        precondition(abs(compact.estimateMB(for: camera, preserveHDR: false) - 79.5375) < 0.01)
+        let editor = ProfileEditor(profile: compact, info: camera, sourceMB: 340)
+        editor.bitrate.stringValue = "0,5"
+        editor.resolution.stringValue = "480"
+        editor.audio.selectItem(at: 1)
+        editor.changed()
+        let custom = editor.result!
+        precondition(custom.standardBitrate == 0.5 && custom.targetShortSide == 480 && custom.audioMode == "remove")
+        let restored = try! JSONDecoder().decode(CompressionProfile.self, from: JSONEncoder().encode(custom))
+        precondition(restored.valid && restored.custom && restored.standardBitrate == 0.5)
+        sourceInfo = camera
+        precondition(compressionArguments(restored).contains("--allow-larger"))
+        editor.bitrate.stringValue = "nan"; editor.changed()
+        precondition(editor.result == nil && !editor.alert.buttons[0].isEnabled)
+        editor.resetProfile()
+        precondition(editor.result!.targetShortSide == compact.targetShortSide)
+        precondition(abs(editor.result!.standardBitrate - compact.standardBitrate) < 0.00001)
+        let beforeSize = editor.result!.estimateMB(for: camera, preserveHDR: false)
+        editor.resolution.stringValue = "360"; editor.changed()
+        precondition(editor.result!.estimateMB(for: camera, preserveHDR: false) < beforeSize)
+        editor.resetProfile()
+        precondition(editor.automaticBitrate.state == .on)
+        precondition(profileNameKey("  TEST  ") == profileNameKey("test"))
+        precondition(suggestedProfileName("HD", existing: ["hd — копия", " HD — КОПИЯ 2 "]) == "HD — копия 3")
+        var override = compact
+        override.custom = true
+        customProfiles = [override]
+        precondition(compressionProfiles(for: camera).filter { $0.id == compact.id }.count == 1)
+        customProfiles = []
+        sourceInfo = nil
         modeControl.selectedSegment = EditorMode.join.rawValue
         joinClips = [JoinClip(id: UUID(), url: source, info: info, lowerValue: 0, upperValue: 2, thumbnails: [], volume: 0.4, waveform: [0.1, 1, 0.2], speed: 2)]
         joinTable.reloadData()

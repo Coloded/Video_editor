@@ -50,6 +50,28 @@ class EngineTests(unittest.TestCase):
                       '--plain-progress', '-o', output, *extra])
         return result, output
 
+    def test_custom_compression_parameters(self):
+        for codec, audio in [('h264', 'remove'), ('hevc', 'aac')]:
+            output = self.root / f'custom-{codec}.mp4'
+            result = run([ENGINE, 'compress', '2160', '-f', self.source, '-o', output,
+                          '--short-side', '128', '--bitrate', '0.3', '--codec', codec,
+                          '--fps', '15', '--audio-mode', audio, '--audio-bitrate', '64',
+                          '--allow-larger', '--cpu', '--convert-sdr', '--plain-progress'])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            data = self.probe(output)
+            video = data['streams'][0]
+            self.assertEqual(video['codec_name'], codec)
+            self.assertEqual(video['height'], 128)
+            self.assertEqual(video['avg_frame_rate'], '15/1')
+            self.assertEqual(len(data['streams']), 1 if audio == 'remove' else 2)
+            self.assertAlmostEqual(float(data['format']['duration']), 2, delta=.15)
+            self.assertIn('экономия', result.stdout)
+        invalid = self.root / 'invalid-profile.mp4'
+        result = run([ENGINE, 'compress', '240', '-f', self.source, '-o', invalid,
+                      '--short-side', '129', '--cpu'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(invalid.exists())
+
     def test_output_containers(self):
         manifest = self.root / 'formats.tsv'
         manifest.write_text(f'{self.source}\t0\t2\t1\t1\n')

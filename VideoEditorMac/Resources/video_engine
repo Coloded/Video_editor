@@ -19,6 +19,12 @@ OVERWRITE=0
 COMPRESS_PROFILE=""
 CODEC_RAW=""
 BITRATE_RAW=""
+SHORT_SIDE_RAW=""
+FPS_RAW=""
+AUDIO_MODE="auto"
+AUDIO_RATE_RAW=""
+REQUIRE_HARDWARE=0
+ALLOW_LARGER=0
 HDR_MODE="auto"
 USE_SOFTWARE=0
 PLAIN_PROGRESS=0
@@ -80,6 +86,12 @@ video_editor — вырезание, сжатие и склейка аудио/�
                         youtube или youtube-compact
   -c, --codec CODEC     h264 или hevc; переопределяет кодек профиля
   -b, --bitrate MBPS    Видеобитрейт в Мбит/с, например 40 или 40M
+  --short-side PX      Короткая сторона 128–4320, чётное число
+  --fps N              15, 24, 25, 30, 50 или 60; по умолчанию исходная
+  --audio-mode MODE    auto, aac или remove
+  --audio-bitrate N    AAC, 32–320 кбит/с
+  --require-hardware  Ошибка, если аппаратный кодировщик недоступен
+  --allow-larger       Разрешить увеличение разрешения и размера
   --preserve-hdr        Сохранить HDR и 10 бит в HEVC Main 10
   --convert-sdr         Преобразовать HDR в совместимый SDR 8 бит
   --no-gpu, --cpu       Не использовать VideoToolbox; кодировать процессором
@@ -1036,6 +1048,24 @@ while (( $# > 0 )); do
       BITRATE_RAW="$2"
       shift 2
       ;;
+    --short-side|--fps|--audio-mode|--audio-bitrate)
+      (( $# >= 2 )) || die "после $1 нужно указать значение"
+      case "$1" in
+        --short-side) SHORT_SIDE_RAW="$2" ;;
+        --fps) FPS_RAW="$2" ;;
+        --audio-mode) AUDIO_MODE="$2" ;;
+        --audio-bitrate) AUDIO_RATE_RAW="$2" ;;
+      esac
+      shift 2
+      ;;
+    --require-hardware)
+      REQUIRE_HARDWARE=1
+      shift
+      ;;
+    --allow-larger)
+      ALLOW_LARGER=1
+      shift
+      ;;
     --preserve-hdr)
       HDR_MODE="preserve"
       shift
@@ -1364,9 +1394,27 @@ if [[ "$COMMAND" == "compress" ]]; then
     VIDEO_BITRATE="$(normalize_bitrate "$HEVC_PROFILE_BITRATE")"
   fi
 
+  if [[ -n "$SHORT_SIDE_RAW" ]]; then
+    [[ "$SHORT_SIDE_RAW" =~ '^[0-9]{3,4}$' ]] || die "короткая сторона: чётное число 128–4320"
+    (( SHORT_SIDE_RAW >= 128 && SHORT_SIDE_RAW <= 4320 && SHORT_SIDE_RAW % 2 == 0 )) || die "короткая сторона: чётное число 128–4320"
+    TARGET_SHORT_SIDE="$SHORT_SIDE_RAW"
+    PRESET_LABEL="${TARGET_SHORT_SIDE}p, пользовательские параметры"
+  fi
+  case "$FPS_RAW" in
+    ""|15|24|25|30|50|60) ;;
+    *) die "частота кадров: 15, 24, 25, 30, 50 или 60" ;;
+  esac
+  case "$AUDIO_MODE" in auto|aac|remove) ;; *) die "звук: auto, aac или remove" ;; esac
+  if [[ -n "$AUDIO_RATE_RAW" ]]; then
+    [[ "$AUDIO_RATE_RAW" =~ '^[0-9]{2,3}$' ]] || die "битрейт звука: 32–320 кбит/с"
+    (( AUDIO_RATE_RAW >= 32 && AUDIO_RATE_RAW <= 320 )) || die "битрейт звука: 32–320 кбит/с"
+    AUDIO_BITRATE_KBPS="$AUDIO_RATE_RAW"
+  fi
+  (( REQUIRE_HARDWARE == 0 || USE_SOFTWARE == 0 )) || die "аппаратный кодировщик несовместим с --cpu"
+
   SOURCE_SHORT_SIDE="$(awk -v width="$DISPLAY_WIDTH" -v height="$DISPLAY_HEIGHT" \
     'BEGIN { print (width < height ? width : height) }')"
-  if ! awk -v source="$SOURCE_SHORT_SIDE" -v target="$TARGET_SHORT_SIDE" \
+  if [[ "$ALLOW_LARGER" == "0" ]] && ! awk -v source="$SOURCE_SHORT_SIDE" -v target="$TARGET_SHORT_SIDE" \
     'BEGIN { exit !(source >= target) }'; then
     echo "Файл плохого качества для профиля $COMPRESS_PROFILE:" >&2
     echo "  разрешение ${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}, короткая сторона ${SOURCE_SHORT_SIDE}px." >&2
@@ -1424,6 +1472,10 @@ if [[ "$COMMAND" == "compress" ]]; then
     COLOR_MODE_LABEL="10/12-бит → SDR 8-бит"
   fi
 
+  if [[ -n "$FPS_RAW" ]]; then
+    [[ -n "$FILTER_CHAIN" ]] && FILTER_CHAIN+=","
+    FILTER_CHAIN+="fps=${FPS_RAW}"
+  fi
   FILTER_ARGS=()
   [[ -n "$FILTER_CHAIN" ]] && FILTER_ARGS=(-vf "$FILTER_CHAIN")
 
@@ -1446,7 +1498,7 @@ if [[ "$COMMAND" == "compress" ]]; then
       size_required = target * 1.05
       printf "%.3f", (quality_required > size_required ? quality_required : size_required)
     }')"
-    if ! awk -v source="$SOURCE_BITRATE_MBPS" -v required="$REQUIRED_SOURCE_BITRATE" \
+    if [[ "$ALLOW_LARGER" == "0" ]] && ! awk -v source="$SOURCE_BITRATE_MBPS" -v required="$REQUIRED_SOURCE_BITRATE" \
       'BEGIN { exit !(source > required) }'; then
       echo "Файл уже сжат сильнее выбранного профиля $COMPRESS_PROFILE:" >&2
       echo "  исходный видеобитрейт: ${SOURCE_BITRATE_MBPS} Мбит/с" >&2
@@ -1489,7 +1541,7 @@ OUTPUT="$(unique_output_path "$OUTPUT")"
   MUXER_ARGS=()
   HEVC_TAG_ARGS=()
   if [[ "$OUTPUT_EXTENSION" == "mp4" || "$OUTPUT_EXTENSION" == "mov" ]]; then
-    MUXER_ARGS=(-movflags +faststart -use_editlist 0)
+    MUXER_ARGS=(-movflags +faststart)
     HEVC_TAG_ARGS=(-tag:v hvc1)
   fi
   ERROR_LOG="$(mktemp -t video-editor-compress.XXXXXX)"
@@ -1519,6 +1571,7 @@ OUTPUT="$(unique_output_path "$OUTPUT")"
     set -e
 
     if [[ "$HARDWARE_TEST_STATUS" != "0" ]]; then
+      (( REQUIRE_HARDWARE == 0 )) || die "аппаратный кодировщик недоступен для выбранных параметров"
       echo "VideoToolbox не смог открыть ${TARGET_WIDTH}x${TARGET_HEIGHT}; использую процессор."
       USE_SOFTWARE=1
     fi
@@ -1598,9 +1651,12 @@ OUTPUT="$(unique_output_path "$OUTPUT")"
     die "кодировщик $VIDEO_ENCODER недоступен в установленном FFmpeg"
 
   AUDIO_ARGS=(-map "0:a:0?")
-  if [[ -z "$SOURCE_AUDIO_CODEC" ]]; then
+  if [[ "$AUDIO_MODE" == "remove" ]]; then
+    AUDIO_ARGS=(-an)
+    AUDIO_LABEL="звук удалён"
+  elif [[ -z "$SOURCE_AUDIO_CODEC" ]]; then
     AUDIO_LABEL="нет аудиодорожки"
-  elif [[ "$SOURCE_AUDIO_CODEC" == "aac" ]]; then
+  elif [[ "$SOURCE_AUDIO_CODEC" == "aac" && "$AUDIO_MODE" == "auto" ]]; then
     AUDIO_ARGS+=(-c:a copy)
     AUDIO_LABEL="AAC без повторного кодирования"
   else
@@ -1628,9 +1684,9 @@ OUTPUT="$(unique_output_path "$OUTPUT")"
   echo "Аудио:          $AUDIO_LABEL"
   echo "Результат:      $OUTPUT"
 
-  if [[ -z "$SOURCE_AUDIO_CODEC" ]]; then
+  if [[ -z "$SOURCE_AUDIO_CODEC" || "$AUDIO_MODE" == "remove" ]]; then
     ESTIMATED_AUDIO_MBPS="0"
-  elif [[ "$SOURCE_AUDIO_CODEC" == "aac" && -n "$SOURCE_AUDIO_BITRATE" && "$SOURCE_AUDIO_BITRATE" != "N/A" ]]; then
+  elif [[ "$AUDIO_MODE" == "auto" && "$SOURCE_AUDIO_CODEC" == "aac" && -n "$SOURCE_AUDIO_BITRATE" && "$SOURCE_AUDIO_BITRATE" != "N/A" ]]; then
     ESTIMATED_AUDIO_MBPS="$(awk -v bitrate="$SOURCE_AUDIO_BITRATE" \
       'BEGIN { printf "%.6f", bitrate / 1000000 }')"
   else
@@ -1677,7 +1733,6 @@ OUTPUT="$(unique_output_path "$OUTPUT")"
         "${VIDEO_ARGS[@]}" \
         -fps_mode passthrough \
         -movflags +faststart \
-        -use_editlist 0 \
         "$SAMPLE_FILE" >/dev/null 2>&1 &
       FFMPEG_PID="$!"
       wait "$FFMPEG_PID"
@@ -1725,7 +1780,7 @@ OUTPUT="$(unique_output_path "$OUTPUT")"
     echo "Прогноз размера: $(format_file_size "$ESTIMATED_LOW_BYTES")–$(format_file_size "$ESTIMATED_MAX_BYTES") (VBR)"
   fi
 
-  if [[ "$COMPARISON_SOURCE_BYTES" =~ '^[0-9]+$' && "$COMPARISON_SOURCE_BYTES" -gt 0 ]]; then
+  if [[ "$ALLOW_LARGER" == "0" && "$COMPARISON_SOURCE_BYTES" =~ '^[0-9]+$' && "$COMPARISON_SOURCE_BYTES" -gt 0 ]]; then
     MAX_COMPRESSED_BYTES="$(awk -v bytes="$COMPARISON_SOURCE_BYTES" 'BEGIN { printf "%.0f", bytes * 0.98 }')"
     if ! awk -v estimate="$ESTIMATED_BYTES" -v maximum="$MAX_COMPRESSED_BYTES" \
       'BEGIN { exit !(estimate < maximum) }'; then
@@ -1900,7 +1955,7 @@ OUTPUT="$(unique_output_path "$OUTPUT")"
   fi
 
   FINAL_BYTES="$(stat -f "%z" "$TEMP_OUTPUT" 2>/dev/null || true)"
-  if [[ "$FINAL_BYTES" =~ '^[0-9]+$' && "$COMPARISON_SOURCE_BYTES" =~ '^[0-9]+$' && \
+  if [[ "$ALLOW_LARGER" == "0" && "$FINAL_BYTES" =~ '^[0-9]+$' && "$COMPARISON_SOURCE_BYTES" =~ '^[0-9]+$' && \
     "$COMPARISON_SOURCE_BYTES" -gt 0 && "$FINAL_BYTES" -ge "$COMPARISON_SOURCE_BYTES" ]]; then
     rm -f "$TEMP_OUTPUT"
     die "результат $(format_file_size "$FINAL_BYTES") не меньше исходника $(format_file_size "$COMPARISON_SOURCE_BYTES"); файл не сохранён"
@@ -1914,7 +1969,10 @@ OUTPUT="$REPLY"
       -of default=noprint_wrappers=1:nokey=1 \
       "$OUTPUT" 2>/dev/null || true
   )"
-  [[ -n "$FINAL_BYTES" ]] && echo "Итоговый размер: $(format_file_size "$FINAL_BYTES")"
+  if [[ -n "$FINAL_BYTES" ]]; then
+    SAVING_PERCENT="$(awk -v before="$COMPARISON_SOURCE_BYTES" -v after="$FINAL_BYTES" 'BEGIN { if (before > 0) printf "%.0f", (1-after/before)*100; else print 0 }')"
+    echo "Итоговый размер: $(format_file_size "$COMPARISON_SOURCE_BYTES") → $(format_file_size "$FINAL_BYTES") · экономия ${SAVING_PERCENT}%"
+  fi
   if [[ -n "$FINAL_BITRATE_RAW" && "$FINAL_BITRATE_RAW" != "N/A" ]]; then
     FINAL_BITRATE_MBPS="$(awk -v bitrate="$FINAL_BITRATE_RAW" \
       'BEGIN { printf "%.3f", bitrate / 1000000 }')"
