@@ -14,6 +14,7 @@ LEGACY_APP="$INSTALL_DIR/Video Editor.app"
 DIST="$WORKSPACE/dist"
 
 CHECK_ONLY=0
+NO_INSTALL=0
 SKIP_RUNTIME_CHECK=0
 STAGING=""
 PREVIOUS_APP=""
@@ -41,6 +42,7 @@ usage() {
   ./VideoEditorMac/build_app.sh --skip-runtime-check
 
 Параметры:
+  --no-install          Собрать в dist, не устанавливая в /Applications
   --check-only          Только проверить окружение, ничего не собирать
   --skip-runtime-check  Не требовать FFmpeg/ffprobe во время сборки
   -h, --help           Показать эту справку
@@ -52,6 +54,7 @@ EOF
 }
 
 confirm() {
+  [[ "$CHECK_ONLY" == 0 ]] || return 1
   local prompt="$1"
   local answer=""
   if [[ "${VIDEO_EDITOR_ASSUME_YES:-0}" == "1" ]]; then
@@ -76,15 +79,22 @@ cleanup() {
     mv "$PREVIOUS_LEGACY_APP" "$LEGACY_APP" || \
       warn "Не удалось автоматически восстановить: $LEGACY_APP"
   fi
+  if [[ ( -n "$PREVIOUS_APP" && -e "$PREVIOUS_APP" ) || ( -n "$PREVIOUS_LEGACY_APP" && -e "$PREVIOUS_LEGACY_APP" ) ]]; then
+    warn "Резервная копия сохранена для ручного восстановления: $STAGING"
+    return
+  fi
   if [[ -n "$STAGING" && -d "$STAGING" && "${STAGING:t}" == video-editor-app.* ]]; then
     rm -rf -- "$STAGING"
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 while (( $# > 0 )); do
   case "$1" in
     --check-only) CHECK_ONLY=1 ;;
+    --no-install) NO_INSTALL=1 ;;
     --skip-runtime-check) SKIP_RUNTIME_CHECK=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "неизвестный параметр: $1" ;;
@@ -241,7 +251,9 @@ if [[ "$AVAILABLE_KB" =~ '^[0-9]+$' ]] && (( AVAILABLE_KB < 102400 )); then
 fi
 
 check_runtime_tools
-SPARKLE_ROOT="$($SPARKLE_FETCH)" || die "не удалось подготовить Sparkle для автообновлений"
+SPARKLE_ARGS=()
+[[ "$CHECK_ONLY" == 1 ]] && SPARKLE_ARGS+=(--check-only)
+SPARKLE_ROOT="$("$SPARKLE_FETCH" "${SPARKLE_ARGS[@]}")" || die "не удалось подготовить Sparkle для автообновлений"
 SPARKLE_FRAMEWORK="$SPARKLE_ROOT/Sparkle.framework"
 [[ -d "$SPARKLE_FRAMEWORK" ]] || die "не найден Sparkle.framework: $SPARKLE_FRAMEWORK"
 [[ -f "$SPARKLE_ROOT/LICENSE" ]] || die "не найдена лицензия Sparkle: $SPARKLE_ROOT/LICENSE"
@@ -253,7 +265,7 @@ if [[ "$CHECK_ONLY" == "1" ]]; then
   success "Все обязательные проверки пройдены. Сборку можно запускать."
   exit 0
 fi
-[[ -w "$INSTALL_DIR" ]] || \
+[[ "$NO_INSTALL" == 1 || -w "$INSTALL_DIR" ]] || \
   die "нет прав на запись в $INSTALL_DIR. Запустите сборку из учётной записи администратора или установите готовый DMG вручную"
 
 if ! STAGING="$(mktemp -d -t video-editor-app.XXXXXX)" || [[ ! -d "$STAGING" ]]; then
@@ -345,6 +357,11 @@ chmod 755 "$STAGED_APP/Contents/MacOS/VideoEditor" || die "не удалось �
 chmod 755 "$STAGED_APP/Contents/Resources/video_engine" || die "не удалось сделать video_engine исполняемым"
 printf 'APPL????' > "$STAGED_APP/Contents/PkgInfo" || die "не удалось создать PkgInfo"
 
+printf '{"main.swift":"%s","video_engine":"%s","Info.plist":"%s"}\n' \
+  "$(shasum -a 256 "$SOURCE" | awk '{print $1}')" \
+  "$(shasum -a 256 "$ENGINE" | awk '{print $1}')" \
+  "$(shasum -a 256 "$PLIST" | awk '{print $1}')" > "$STAGED_APP/Contents/Resources/BuildManifest.json"
+
 info "Проверяю собранное приложение"
 plutil -lint "$STAGED_APP/Contents/Info.plist" >/dev/null || die "Info.plist в готовом bundle повреждён"
 ARCHS="$(lipo -archs "$STAGED_APP/Contents/MacOS/VideoEditor" 2>/dev/null)" || \
@@ -384,6 +401,10 @@ fi
 [[ -s "$DMG_TEMP" ]] || die "созданный DMG отсутствует или пуст: $DMG_TEMP"
 hdiutil verify "$DMG_TEMP" >/dev/null || die "проверка целостности DMG завершилась ошибкой"
 
+if [[ "$NO_INSTALL" == 1 ]]; then
+  APP="$DIST/Video_Editor.app"
+  LEGACY_APP="$DIST/Video Editor.app"
+fi
 if [[ -e "$APP" ]]; then
   PREVIOUS_APP="$STAGING/Previous Video_Editor.app"
   mv "$APP" "$PREVIOUS_APP" || die "не удалось временно убрать предыдущую сборку: $APP"
@@ -413,7 +434,7 @@ STABLE_DMG="$DIST/Video_Editor-stable.dmg"
 ditto "$DMG" "$STABLE_DMG" || die "не удалось создать stable-DMG: $STABLE_DMG"
 hdiutil verify "$STABLE_DMG" >/dev/null || die "stable-DMG не прошёл проверку целостности"
 
-success "Приложение собрано и установлено"
+success "Приложение собрано: $APP"
 print -r -- "$APP"
 success "Установочный образ создан"
 print -r -- "$DMG"

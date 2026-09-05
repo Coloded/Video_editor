@@ -23,6 +23,7 @@ HDR_MODE="auto"
 USE_SOFTWARE=0
 PLAIN_PROGRESS=0
 TMP_FILES=()
+TMP_DIRS=()
 FFMPEG_PID=""
 
 cleanup() {
@@ -31,11 +32,16 @@ cleanup() {
     kill "$FFMPEG_PID" 2>/dev/null || true
     wait "$FFMPEG_PID" 2>/dev/null || true
   fi
+  for file in "${TMP_DIRS[@]:-}"; do
+    [[ -n "$file" && "${file:t}" == .video-editor.* ]] && rm -rf -- "$file"
+  done
   for file in "${TMP_FILES[@]:-}"; do
     [[ -n "$file" && -e "$file" ]] && rm -f "$file"
   done
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 usage() {
   cat <<'EOF'
@@ -81,8 +87,8 @@ video_editor — вырезание, сжатие и склейка аудио/�
   -s START -e END       Одновременно вырезать и сжать указанный фрагмент
 
 Параметры join:
-  --manifest FILE       TSV: путь, старт, конец и громкость каждого ролика
-  --audio-manifest FILE TSV: аудио, начало, конец, позиция и громкость
+  --manifest FILE       TSV: путь, старт, конец, громкость, скорость (0.1–10)
+  --audio-manifest FILE TSV: аудио, начало, конец, позиция, громкость, скорость
   -p, --profile NAME    Дополнительно сжать результат выбранным профилем
   --no-gpu, --cpu       Склеивать и кодировать процессором
 
@@ -177,6 +183,7 @@ parse_time() {
       seconds = part[1] * 3600 + part[2] * 60 + part[3]
     }
 
+    if (seconds < 0 || seconds > 31536000) exit 1
     printf "%.6f", seconds
   }'
 }
@@ -284,7 +291,7 @@ smooth_size_estimate() {
 unique_output_path() {
   local candidate="$1"
 
-  if [[ "$OVERWRITE" == "1" || ! -e "$candidate" ]]; then
+  if [[ "$OVERWRITE" == "1" || ( ! -e "$candidate" && ! -L "$candidate" ) ]]; then
     echo "$candidate"
     return
   fi
@@ -302,11 +309,81 @@ unique_output_path() {
   fi
 
   number=1
-  while [[ -e "$dir/$stem-$number$extension" ]]; do
+  while [[ -e "$dir/$stem-$number$extension" || -L "$dir/$stem-$number$extension" ]]; do
     number=$((number + 1))
   done
 
   echo "$dir/$stem-$number$extension"
+}
+
+# Publish on the same filesystem. link(2) fails atomically if another job won
+# the name, so no existing destination (including symlinks) is overwritten.
+temporary_output() {
+  local requested="$1" directory
+  directory="$(mktemp -d "${requested:h}/.video-editor.XXXXXX")" || die "не удалось создать временную папку результата"
+  TMP_DIRS+=("$directory")
+  REPLY="$directory/output.${requested:e}"
+}
+
+publish_output() {
+  local temporary="$1" requested="$2" candidate="$2"
+  if [[ "$OVERWRITE" == 1 ]]; then
+    mv -f -- "$temporary" "$candidate" || return 1
+  else
+    while ! ln -- "$temporary" "$candidate" 2>/dev/null; do
+      [[ -e "$candidate" || -L "$candidate" ]] || die "не удалось сохранить результат: $candidate"
+      candidate="$(unique_output_path "$requested")"
+    done
+    rm -f -- "$temporary"
+  fi
+  REPLY="$candidate"
+  printf 'RESULT_BASE64=%s\n' "$(printf '%s' "$candidate" | /usr/bin/base64 | tr -d '\n')"
+}
+
+has_encoder() {
+  ffmpeg -hide_banner -encoders 2>/dev/null | awk -v wanted="$1" '$2 == wanted { found=1 } END { exit !found }'
+}
+
+# Chain factors in [0.5, 2] to preserve audio at every supported speed.
+tempo_filter() {
+  awk -v speed="$1" 'BEGIN {
+    while (speed > 2.000001) { printf "atempo=2,"; speed /= 2 }
+    while (speed < 0.499999) { printf "atempo=0.5,"; speed *= 2 }
+    printf "atempo=%.8f", speed
+  }'
+}
+
+preflight_encoder() {
+  local encoder="$1" width="$2" height="$3" pixel="$4" result=0
+  local -a profile_args
+  profile_args=()
+  [[ "$pixel" == p010le ]] && profile_args=(-profile:v main10)
+  ffmpeg -v error -nostdin -f lavfi -i "color=s=${width}x${height}:d=0.04" \
+    -vf "format=$pixel" -frames:v 1 -c:v "$encoder" "${profile_args[@]}" -allow_sw 1 -f null - >/dev/null 2>&1 &
+  FFMPEG_PID="$!"
+  wait "$FFMPEG_PID" || result="$?"
+  FFMPEG_PID=""
+  return "$result"
+}
+
+hdr_to_sdr_filter() {
+  local transfer="$1" linear peak red green blue
+  if [[ "$transfer" == arib-std-b67 ]]; then
+    linear="5*if(lte(V,0.5),V*V/3,(exp((V-0.55991073)/0.17883277)+0.28466892)/12)"
+    peak=5
+  else
+    linear="100*pow(max(pow(V,1/78.84375)-0.8359375,0)/(18.8515625-18.6875*pow(V,1/78.84375)),1/0.1593017578125)"
+    peak=100
+  fi
+  red="${linear//V/r(X,Y)}"; green="${linear//V/g(X,Y)}"; blue="${linear//V/b(X,Y)}"
+  local result="format=gbrpf32le,geq=r='${red}':g='${green}':b='${blue}'"
+  # BT.2020 -> BT.709 in linear floating point: retain highlights above 1.
+  result+=",geq=r='max(0,1.660491*r(X,Y)-0.587641*g(X,Y)-0.072850*b(X,Y))':g='max(0,-0.124550*r(X,Y)+1.132900*g(X,Y)-0.008349*b(X,Y))':b='max(0,-0.018151*r(X,Y)-0.100579*g(X,Y)+1.118730*b(X,Y))'"
+  result+=",setparams=range=full:color_primaries=bt709:color_trc=linear:colorspace=gbr,tonemap=hable:desat=0:peak=${peak}"
+  linear="if(lt(V,0.018),4.5*V,1.099*pow(max(V,0),0.45)-0.099)"
+  red="${linear//V/r(X,Y)}"; green="${linear//V/g(X,Y)}"; blue="${linear//V/b(X,Y)}"
+  result+=",geq=r='${red}':g='${green}':b='${blue}',setparams=range=full:color_primaries=bt709:color_trc=bt709:colorspace=gbr,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
+  print -r -- "$result"
 }
 
 print_progress() {
@@ -381,11 +458,11 @@ run_join() {
   manifest="${MANIFEST_RAW:A}"
   [[ -f "$manifest" ]] || die "манифест не найден: $MANIFEST_RAW"
 
-  local -a inputs starts ends durations volumes has_audio input_args clip_hdr clip_tonemap clip_transfers
-  local clip_path start_raw end_raw volume_raw start end duration clip_duration clip_bytes volume
+  local -a inputs starts ends durations volumes speeds has_audio input_args clip_hdr clip_tonemap clip_transfers
+  local clip_path start_raw end_raw volume_raw speed_raw speed start end duration clip_duration clip_bytes volume
   local clip_codec clip_pixel_format clip_color_transfer
   local source_total_bytes=0
-  while IFS=$'\t' read -r clip_path start_raw end_raw volume_raw; do
+  while IFS=$'\t' read -r clip_path start_raw end_raw volume_raw speed_raw; do
     [[ -n "$clip_path" ]] || continue
     [[ -f "$clip_path" ]] || die "ролик не найден: $clip_path"
     clip_bytes="$(stat -f "%z" "$clip_path" 2>/dev/null || true)"
@@ -408,16 +485,19 @@ run_join() {
       clip_hdr+=("0")
     fi
     duration="$(media_duration "$clip_path")"
-    [[ -n "$duration" && "$duration" != "N/A" ]] || \
+    [[ "$duration" =~ '^[0-9]+([.][0-9]+)?$' ]] && awk -v d="$duration" 'BEGIN {exit !(d>0 && d<=31536000)}' || \
       die "не удалось определить длительность: $clip_path"
     start="$(parse_time "$start_raw")" || die "неверный старт для $clip_path: $start_raw"
     end="$(parse_time "$end_raw")" || die "неверный конец для $clip_path: $end_raw"
     awk -v start="$start" -v end="$end" -v duration="$duration" \
       'BEGIN { exit !(start >= 0 && end > start && end <= duration + 0.001) }' || \
       die "неверные границы фрагмента: $clip_path"
-    clip_duration="$(awk -v start="$start" -v end="$end" \
-      'BEGIN { printf "%.6f", end - start }')"
+    speed="${speed_raw:-1}"
+    [[ "$speed" =~ '^[0-9]+([.][0-9]+)?$' ]] && awk -v value="$speed" 'BEGIN { exit !(value >= 0.1 && value <= 10) }' || die "скорость должна быть от 0.1 до 10"
+    speeds+=("$speed")
+    clip_duration="$(awk -v start="$start" -v end="$end" -v speed="$speed" 'BEGIN { printf "%.6f", (end - start) / speed }')"
     volume="${volume_raw:-1}"
+    [[ "$volume" =~ '^[0-9]+([.][0-9]+)?$' ]] || die "неверная громкость ролика"
     awk -v value="$volume" 'BEGIN { exit !(value >= 0 && value <= 2) }' || \
       die "громкость ролика должна быть от 0 до 2: $clip_path"
     inputs+=("${clip_path:A}")
@@ -447,6 +527,14 @@ run_join() {
   if [[ "$HDR_MODE" == "preserve" && "$hdr_count" != "${#inputs[@]}" ]]; then
     die "HDR-склейка требует, чтобы все ролики были HDR/10-бит; для смешанных роликов выберите SDR"
   fi
+  if [[ "$HDR_MODE" == preserve ]]; then
+    local reference_transfer="${clip_transfers[1]}" reference_primaries reference_space
+    reference_primaries="$(stream_value "${inputs[1]}" v:0 color_primaries)"
+    reference_space="$(stream_value "${inputs[1]}" v:0 color_space)"
+    for clip_path in "${inputs[@]}"; do
+      [[ "$(stream_value "$clip_path" v:0 color_transfer)" == "$reference_transfer" && "$(stream_value "$clip_path" v:0 color_primaries)" == "$reference_primaries" && "$(stream_value "$clip_path" v:0 color_space)" == "$reference_space" ]] || die "разные цветовые пространства/HLG/PQ: выберите SDR для этой склейки"
+    done
+  fi
   local source_summary="${#inputs[@]} шт., $(format_file_size "$source_total_bytes")"
 
   local first="${inputs[1]}"
@@ -454,6 +542,15 @@ run_join() {
   local target_short_side="" output_codec="h264" profile_label="Без дополнительного сжатия"
   first_width="$(stream_value "$first" "v:0" "width")"
   first_height="$(stream_value "$first" "v:0" "height")"
+  local first_sar rotation swap
+  first_sar="$(stream_value "$first" v:0 sample_aspect_ratio)"
+  if [[ "$first_sar" == *:* ]]; then
+    first_width="$(awk -v width="$first_width" -v sar="$first_sar" 'BEGIN { split(sar,a,":"); if(a[1]>0 && a[2]>0) width=width*a[1]/a[2]; printf "%d", int(width/2+0.5)*2 }')"
+  fi
+  rotation="$(ffprobe -v error -select_streams v:0 -show_entries stream_side_data=rotation -of default=nw=1:nk=1 "$first" | head -n 1)"
+  if [[ "$rotation" == 90 || "$rotation" == -90 || "$rotation" == 270 || "$rotation" == -270 ]]; then
+    swap="$first_width"; first_width="$first_height"; first_height="$swap"
+  fi
   first_fps_raw="$(stream_value "$first" "v:0" "avg_frame_rate")"
   first_codec="$(stream_value "$first" "v:0" "codec_name")"
   [[ "$first_width" =~ '^[0-9]+$' && "$first_height" =~ '^[0-9]+$' ]] || \
@@ -528,36 +625,22 @@ run_join() {
   local filter_complex=""
   local concat_inputs=""
   local index zero_index video_filter linear_expr tonemap_peak
-  local hlg_base hlg_linear pq_power pq_linear
-  if [[ "$HDR_MODE" == "sdr" && "$hdr_count" -gt 0 ]]; then
-    hlg_base="if(lte(val/maxval,0.5),(val/maxval)*(val/maxval)/3,(exp(((val/maxval)-0.55991073)/0.17883277)+0.28466892)/12)"
-    hlg_linear="maxval*min(1,5*(${hlg_base}))"
-    pq_power="pow(val/maxval,1/78.84375)"
-    pq_linear="maxval*min(1,100*pow(max((${pq_power})-0.8359375,0)/(18.8515625-18.6875*(${pq_power})),1/0.1593017578125))"
-  fi
   for ((index = 1; index <= ${#inputs[@]}; index++)); do
     zero_index=$((index - 1))
     input_args+=("-i" "${inputs[index]}")
-    video_filter="trim=start=${starts[index]}:end=${ends[index]},setpts=PTS-STARTPTS"
+    video_filter="trim=start=${starts[index]}:end=${ends[index]},setpts=(PTS-STARTPTS)/${speeds[index]}"
     if [[ "$HDR_MODE" == "sdr" && "${clip_tonemap[index]}" == "1" ]]; then
-      if [[ "${clip_transfers[index]}" == "arib-std-b67" ]]; then
-        linear_expr="$hlg_linear"
-        tonemap_peak="5"
-      else
-        linear_expr="$pq_linear"
-        tonemap_peak="100"
-      fi
-      video_filter+=",format=gbrpf32le,lutrgb=r='${linear_expr}':g='${linear_expr}':b='${linear_expr}',setparams=range=full:color_primaries=bt2020:color_trc=linear:colorspace=gbr,colorspace=space=bt709:primaries=bt709:trc=linear:format=yuv444p10,format=gbrpf32le,tonemap=hable:desat=0:peak=${tonemap_peak},setparams=range=full:color_primaries=bt709:color_trc=linear:colorspace=gbr,colorspace=all=bt709:format=yuv420p"
+      video_filter+=",$(hdr_to_sdr_filter "${clip_transfers[index]}")"
     fi
-    video_filter+=",scale=${target_width}:${target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${target_width}:${target_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${target_fps}"
+    video_filter+=",scale=w='trunc(iw*sar/2+0.5)*2':h=ih,setsar=1,scale=${target_width}:${target_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${target_width}:${target_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${target_fps}"
     if [[ "$HDR_MODE" == "preserve" ]]; then
       video_filter+=",format=p010le"
     else
-      video_filter+=",format=yuv420p"
+      video_filter+=",format=yuv420p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=limited"
     fi
     filter_complex+="[${zero_index}:v:0]${video_filter}[v${zero_index}];"
     if [[ "${has_audio[index]}" == "1" ]]; then
-      filter_complex+="[${zero_index}:a:0]atrim=start=${starts[index]}:end=${ends[index]},asetpts=PTS-STARTPTS,volume=${volumes[index]},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${zero_index}];"
+      filter_complex+="[${zero_index}:a:0]atrim=start=${starts[index]}:end=${ends[index]},asetpts=PTS-STARTPTS,$(tempo_filter "${speeds[index]}"),volume=${volumes[index]},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${zero_index}];"
     else
       filter_complex+="anullsrc=r=48000:cl=stereo,atrim=duration=${durations[index]},asetpts=PTS-STARTPTS[a${zero_index}];"
     fi
@@ -567,13 +650,13 @@ run_join() {
   done
   filter_complex+="${concat_inputs}concat=n=${#inputs[@]}:v=1:a=1[joinedv][joineda]"
 
-  local -a overlay_paths overlay_starts overlay_ends overlay_positions overlay_volumes
-  local audio_manifest audio_path audio_start_raw audio_end_raw audio_position_raw audio_volume_raw
+  local -a overlay_paths overlay_starts overlay_ends overlay_positions overlay_volumes overlay_speeds
+  local audio_manifest audio_path audio_start_raw audio_end_raw audio_position_raw audio_volume_raw audio_speed_raw
   local audio_start audio_end audio_position audio_duration audio_volume audio_index ffmpeg_audio_index delay_ms
   if [[ -n "$AUDIO_MANIFEST_RAW" ]]; then
     audio_manifest="${AUDIO_MANIFEST_RAW:A}"
     [[ -f "$audio_manifest" ]] || die "манифест аудио не найден: $AUDIO_MANIFEST_RAW"
-    while IFS=$'\t' read -r audio_path audio_start_raw audio_end_raw audio_position_raw audio_volume_raw; do
+    while IFS=$'\t' read -r audio_path audio_start_raw audio_end_raw audio_position_raw audio_volume_raw audio_speed_raw; do
       [[ -n "$audio_path" ]] || continue
       [[ -f "$audio_path" ]] || die "аудиофайл не найден: $audio_path"
       [[ -n "$(stream_value "$audio_path" "a:0" "codec_name")" ]] || die "в файле нет аудиодорожки: $audio_path"
@@ -582,6 +665,7 @@ run_join() {
       audio_end="$(parse_time "$audio_end_raw")" || die "неверный конец аудио: $audio_path"
       audio_position="$(parse_time "$audio_position_raw")" || die "неверная позиция аудио: $audio_path"
       audio_volume="${audio_volume_raw:-1}"
+      [[ "$audio_volume" =~ '^[0-9]+([.][0-9]+)?$' ]] || die "неверная громкость звука"
       awk -v start="$audio_start" -v end="$audio_end" -v duration="$audio_duration" -v position="$audio_position" -v volume="$audio_volume" \
         'BEGIN { exit !(start >= 0 && end > start && end <= duration + 0.001 && position >= 0 && volume >= 0 && volume <= 2) }' || \
         die "неверные параметры аудиодорожки: $audio_path"
@@ -590,6 +674,9 @@ run_join() {
       overlay_ends+=("$audio_end")
       overlay_positions+=("$audio_position")
       overlay_volumes+=("$audio_volume")
+      speed="${audio_speed_raw:-1}"
+      [[ "$speed" =~ '^[0-9]+([.][0-9]+)?$' ]] && awk -v value="$speed" 'BEGIN { exit !(value >= 0.1 && value <= 10) }' || die "скорость звука должна быть от 0.1 до 10"
+      overlay_speeds+=("$speed")
       input_args+=("-i" "${audio_path:A}")
     done < "$audio_manifest"
   fi
@@ -599,7 +686,7 @@ run_join() {
     for ((audio_index = 1; audio_index <= ${#overlay_paths[@]}; audio_index++)); do
       ffmpeg_audio_index=$((${#inputs[@]} + audio_index - 1))
       delay_ms="$(awk -v value="${overlay_positions[audio_index]}" 'BEGIN { printf "%d", value * 1000 + 0.5 }')"
-      filter_complex+=";[${ffmpeg_audio_index}:a:0]atrim=start=${overlay_starts[audio_index]}:end=${overlay_ends[audio_index]},asetpts=PTS-STARTPTS,volume=${overlay_volumes[audio_index]},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${delay_ms}|${delay_ms},apad,atrim=duration=${total_duration}[overlay${audio_index}]"
+      filter_complex+=";[${ffmpeg_audio_index}:a:0]atrim=start=${overlay_starts[audio_index]}:end=${overlay_ends[audio_index]},asetpts=PTS-STARTPTS,$(tempo_filter "${overlay_speeds[audio_index]}"),volume=${overlay_volumes[audio_index]},aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=${delay_ms}|${delay_ms},apad,atrim=duration=${total_duration}[overlay${audio_index}]"
       mix_inputs+="[overlay${audio_index}]"
     done
     filter_complex+=";[joinedv]null[outv];${mix_inputs}amix=inputs=$((${#overlay_paths[@]} + 1)):duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.98[outa]"
@@ -624,6 +711,9 @@ run_join() {
     mp4|mov|mkv) ;;
     *) die "для склейки выберите выходной формат .mp4, .mov или .mkv" ;;
   esac
+  for clip_path in "${inputs[@]}" "${overlay_paths[@]}"; do
+    [[ ! "$output" -ef "$clip_path" && "${output:A}" != "${clip_path:A}" ]] || die "результат не может заменять исходный файл"
+  done
   output="$(unique_output_path "$output")"
   [[ -d "${output:h}" ]] || die "папка результата не существует: ${output:h}"
 
@@ -675,7 +765,9 @@ run_join() {
   else
     output_color_args=(-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
   fi
-  if [[ "$USE_SOFTWARE" == "0" ]] && ffmpeg -hide_banner -h "encoder=${output_codec}_videotoolbox" >/dev/null 2>&1; then
+  local preflight_pixel=yuv420p
+  [[ "$HDR_MODE" == preserve ]] && preflight_pixel=p010le
+  if [[ "$USE_SOFTWARE" == "0" ]] && has_encoder "${output_codec}_videotoolbox" && preflight_encoder "${output_codec}_videotoolbox" "$target_width" "$target_height" "$preflight_pixel"; then
     video_encoder="${output_codec}_videotoolbox"
     encoder_label="Apple VideoToolbox"
     video_args=(-c:v "$video_encoder" -b:v "${video_bitrate}M" -maxrate "${maxrate}M" -bufsize "${bufsize}M" -allow_sw 1)
@@ -700,7 +792,8 @@ run_join() {
     video_args+=(-tag:v hvc1)
   fi
 
-  local temp_output="${output%.*}.tmp.$$.${output_extension}"
+  temporary_output "$output"
+  local temp_output="$REPLY"
   local -a muxer_args
   muxer_args=()
   if [[ "$output_extension" == "mp4" || "$output_extension" == "mov" ]]; then
@@ -709,7 +802,7 @@ run_join() {
   local error_log
   error_log="$(mktemp -t video-editor-join.XXXXXX)"
   local progress_pipe
-  progress_pipe="$(mktemp -u -t video-editor-join-progress.XXXXXX)"
+  progress_pipe="${temp_output:h}/progress"
   mkfifo "$progress_pipe"
   TMP_FILES+=("$temp_output" "$error_log" "$progress_pipe")
 
@@ -761,7 +854,7 @@ run_join() {
     -nostdin \
     -nostats \
     -stats_period 1 \
-    -progress "$progress_pipe" \
+    -progress pipe:1 \
     "${input_args[@]}" \
     -filter_complex "$filter_complex" \
     -map "[outv]" \
@@ -775,7 +868,7 @@ run_join() {
     -map_metadata -1 \
     -map_chapters -1 \
     "${muxer_args[@]}" \
-    "$temp_output" >/dev/null 2>"$error_log" &
+    "$temp_output" >"$progress_pipe" 2>"$error_log" &
   FFMPEG_PID="$!"
 
   while IFS='=' read -r key value; do
@@ -863,7 +956,8 @@ run_join() {
     return "$ffmpeg_status"
   fi
 
-  mv -f "$temp_output" "$output"
+  publish_output "$temp_output" "$output"
+  output="$REPLY"
   echo "Готово: $output"
   local final_bytes
   final_bytes="$(stat -f "%z" "$output" 2>/dev/null || true)"
@@ -1036,7 +1130,7 @@ INPUT="$(resolve_input "$INPUT_RAW")"
 [[ -f "$INPUT" ]] || die "файл не найден: $INPUT_RAW"
 
 SOURCE_DURATION="$(media_duration "$INPUT")"
-[[ -n "$SOURCE_DURATION" && "$SOURCE_DURATION" != "N/A" ]] || \
+[[ "$SOURCE_DURATION" =~ '^[0-9]+([.][0-9]+)?$' ]] && awk -v d="$SOURCE_DURATION" 'BEGIN {exit !(d>0 && d<=31536000)}' || \
   die "не удалось определить длительность файла"
 
 INPUT_DIR="${INPUT:h}"
@@ -1051,13 +1145,14 @@ else
 fi
 
 if [[ "$COMMAND" == "compress" ]]; then
+  ORIGINAL_SOURCE_DURATION="$SOURCE_DURATION"
+  SOURCE_FILE_BYTES="$(stat -f "%z" "$INPUT" 2>/dev/null || true)"
   TRIM_ACTIVE=0
   INPUT_SEEK_ARGS=()
   INPUT_DURATION_ARGS=()
   if [[ -n "$START_RAW" || -n "$END_RAW" ]]; then
     [[ -n "$START_RAW" && -n "$END_RAW" ]] || \
       die "для сжатия фрагмента укажите одновременно -s и -e"
-    ORIGINAL_SOURCE_DURATION="$SOURCE_DURATION"
     TRIM_START_SECONDS="$(parse_time "$START_RAW")" || die "неверное время старта: $START_RAW"
     TRIM_END_SECONDS="$(parse_time "$END_RAW")" || die "неверное время конца: $END_RAW"
     awk -v start="$TRIM_START_SECONDS" -v end="$TRIM_END_SECONDS" \
@@ -1069,6 +1164,12 @@ if [[ "$COMMAND" == "compress" ]]; then
     INPUT_SEEK_ARGS=(-ss "$TRIM_START_SECONDS")
     INPUT_DURATION_ARGS=(-t "$SOURCE_DURATION")
     TRIM_ACTIVE=1
+  fi
+  if [[ "$SOURCE_FILE_BYTES" =~ '^[0-9]+$' && "$SOURCE_FILE_BYTES" -gt 0 ]]; then
+    COMPARISON_SOURCE_BYTES="$(awk -v bytes="$SOURCE_FILE_BYTES" -v selected="$SOURCE_DURATION" \
+      -v full="$ORIGINAL_SOURCE_DURATION" 'BEGIN { printf "%.0f", bytes * selected / full }')"
+  else
+    COMPARISON_SOURCE_BYTES="0"
   fi
 
   SOURCE_VIDEO_CODEC="$(stream_value "$INPUT" "v:0" "codec_name")"
@@ -1313,19 +1414,8 @@ if [[ "$COMMAND" == "compress" ]]; then
     [[ -n "$SOURCE_COLOR_RANGE" ]] && OUTPUT_COLOR_ARGS+=(-color_range "$SOURCE_COLOR_RANGE")
   elif [[ "$HDR_MODE" == "sdr" && "$SOURCE_HDR" == "1" ]]; then
     command -v ffmpeg >/dev/null 2>&1 || die "FFmpeg необходим для преобразования HDR в SDR"
-    HLG_BASE="if(lte(val/maxval,0.5),(val/maxval)*(val/maxval)/3,(exp(((val/maxval)-0.55991073)/0.17883277)+0.28466892)/12)"
-    HLG_LINEAR="maxval*min(1,5*(${HLG_BASE}))"
-    PQ_POWER="pow(val/maxval,1/78.84375)"
-    PQ_LINEAR="maxval*min(1,100*pow(max((${PQ_POWER})-0.8359375,0)/(18.8515625-18.6875*(${PQ_POWER})),1/0.1593017578125))"
-    if [[ "$SOURCE_COLOR_TRANSFER" == "arib-std-b67" ]]; then
-      LINEAR_EXPR="$HLG_LINEAR"
-      TONEMAP_PEAK="5"
-    else
-      LINEAR_EXPR="$PQ_LINEAR"
-      TONEMAP_PEAK="100"
-    fi
     [[ -n "$FILTER_CHAIN" ]] && FILTER_CHAIN+=","
-    FILTER_CHAIN+="format=gbrpf32le,lutrgb=r='${LINEAR_EXPR}':g='${LINEAR_EXPR}':b='${LINEAR_EXPR}',setparams=range=full:color_primaries=bt2020:color_trc=linear:colorspace=gbr,colorspace=space=bt709:primaries=bt709:trc=linear:format=yuv444p10,format=gbrpf32le,tonemap=hable:desat=0:peak=${TONEMAP_PEAK},setparams=range=full:color_primaries=bt709:color_trc=linear:colorspace=gbr,colorspace=all=bt709:format=yuv420p"
+    FILTER_CHAIN+="$(hdr_to_sdr_filter "$SOURCE_COLOR_TRANSFER")"
     OUTPUT_COLOR_ARGS=(-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv)
     COLOR_MODE_LABEL="HDR → SDR 8-бит, tone mapping"
   elif [[ "$SOURCE_HIGH_BIT_DEPTH" == "1" ]]; then
@@ -1340,6 +1430,29 @@ if [[ "$COMMAND" == "compress" ]]; then
   if [[ -n "$SOURCE_VIDEO_BITRATE" && "$SOURCE_VIDEO_BITRATE" != "N/A" && "$SOURCE_VIDEO_BITRATE" != "0" ]]; then
     SOURCE_BITRATE_MBPS="$(awk -v bitrate="$SOURCE_VIDEO_BITRATE" \
       'BEGIN { printf "%.3f", bitrate / 1000000 }')"
+
+    QUALITY_FACTOR="1"
+    if [[ "$SOURCE_VIDEO_CODEC" == "h264" && "$VIDEO_CODEC" == "hevc" ]]; then
+      QUALITY_FACTOR="1.45"
+    elif [[ "$SOURCE_VIDEO_CODEC" == "hevc" && "$VIDEO_CODEC" == "h264" ]]; then
+      QUALITY_FACTOR="0.60"
+    elif [[ "$SOURCE_VIDEO_CODEC" == "av1" && "$VIDEO_CODEC" == "h264" ]]; then
+      QUALITY_FACTOR="0.50"
+    elif [[ "$SOURCE_VIDEO_CODEC" == "av1" && "$VIDEO_CODEC" == "hevc" ]]; then
+      QUALITY_FACTOR="0.80"
+    fi
+    REQUIRED_SOURCE_BITRATE="$(awk -v target="$VIDEO_BITRATE" -v quality="$QUALITY_FACTOR" 'BEGIN {
+      quality_required = target * quality
+      size_required = target * 1.05
+      printf "%.3f", (quality_required > size_required ? quality_required : size_required)
+    }')"
+    if ! awk -v source="$SOURCE_BITRATE_MBPS" -v required="$REQUIRED_SOURCE_BITRATE" \
+      'BEGIN { exit !(source > required) }'; then
+      echo "Файл уже сжат сильнее выбранного профиля $COMPRESS_PROFILE:" >&2
+      echo "  исходный видеобитрейт: ${SOURCE_BITRATE_MBPS} Мбит/с" >&2
+      echo "  профиль рассчитан на: ${VIDEO_BITRATE} Мбит/с" >&2
+      die "результат мог бы стать больше исходника; выберите профиль ниже"
+    fi
   else
     SOURCE_BITRATE_MBPS="неизвестно"
   fi
@@ -1366,11 +1479,13 @@ if [[ "$COMMAND" == "compress" ]]; then
     mp4|mov|mkv) ;;
     *) die "для сжатия выберите выходной формат .mp4, .mov или .mkv" ;;
   esac
-  OUTPUT="$(unique_output_path "$OUTPUT")"
+  [[ ! "$OUTPUT" -ef "$INPUT" && "${OUTPUT:A}" != "${INPUT:A}" ]] || die "результат не может заменять исходный файл"
+OUTPUT="$(unique_output_path "$OUTPUT")"
   OUTPUT_DIR="${OUTPUT:h}"
   [[ -d "$OUTPUT_DIR" ]] || die "папка результата не существует: $OUTPUT_DIR"
 
-  TEMP_OUTPUT="${OUTPUT%.*}.tmp.$$.${OUTPUT_EXTENSION}"
+  temporary_output "$OUTPUT"
+  TEMP_OUTPUT="$REPLY"
   MUXER_ARGS=()
   HEVC_TAG_ARGS=()
   if [[ "$OUTPUT_EXTENSION" == "mp4" || "$OUTPUT_EXTENSION" == "mov" ]]; then
@@ -1396,8 +1511,11 @@ if [[ "$COMMAND" == "compress" ]]; then
       -allow_sw 1 \
       -b:v "${VIDEO_BITRATE}M" \
       -pix_fmt "$OUTPUT_PIXEL_FORMAT" \
-      -f null - >/dev/null 2>&1
+      -f null - >/dev/null 2>&1 &
+    FFMPEG_PID="$!"
+    wait "$FFMPEG_PID"
     HARDWARE_TEST_STATUS="$?"
+    FFMPEG_PID=""
     set -e
 
     if [[ "$HARDWARE_TEST_STATUS" != "0" ]]; then
@@ -1476,7 +1594,7 @@ if [[ "$COMMAND" == "compress" ]]; then
     fi
   fi
 
-  ffmpeg -hide_banner -h "encoder=$VIDEO_ENCODER" >/dev/null 2>&1 || \
+  has_encoder "$VIDEO_ENCODER" || \
     die "кодировщик $VIDEO_ENCODER недоступен в установленном FFmpeg"
 
   AUDIO_ARGS=(-map "0:a:0?")
@@ -1542,7 +1660,7 @@ if [[ "$COMMAND" == "compress" ]]; then
           if (value + sample > duration) value = duration - sample
           printf "%.6f", value
         }')"
-      SAMPLE_FILE="${OUTPUT%.*}.size-sample-${SAMPLE_INDEX}.$$.mp4"
+      SAMPLE_FILE="${TEMP_OUTPUT:h}/sample-${SAMPLE_INDEX}.mp4"
       TMP_FILES+=("$SAMPLE_FILE")
 
       set +e
@@ -1560,8 +1678,11 @@ if [[ "$COMMAND" == "compress" ]]; then
         -fps_mode passthrough \
         -movflags +faststart \
         -use_editlist 0 \
-        "$SAMPLE_FILE" >/dev/null 2>&1
+        "$SAMPLE_FILE" >/dev/null 2>&1 &
+      FFMPEG_PID="$!"
+      wait "$FFMPEG_PID"
       SAMPLE_STATUS="$?"
+      FFMPEG_PID=""
       set -e
 
       if [[ "$SAMPLE_STATUS" == "0" && -s "$SAMPLE_FILE" ]]; then
@@ -1604,6 +1725,14 @@ if [[ "$COMMAND" == "compress" ]]; then
     echo "Прогноз размера: $(format_file_size "$ESTIMATED_LOW_BYTES")–$(format_file_size "$ESTIMATED_MAX_BYTES") (VBR)"
   fi
 
+  if [[ "$COMPARISON_SOURCE_BYTES" =~ '^[0-9]+$' && "$COMPARISON_SOURCE_BYTES" -gt 0 ]]; then
+    MAX_COMPRESSED_BYTES="$(awk -v bytes="$COMPARISON_SOURCE_BYTES" 'BEGIN { printf "%.0f", bytes * 0.98 }')"
+    if ! awk -v estimate="$ESTIMATED_BYTES" -v maximum="$MAX_COMPRESSED_BYTES" \
+      'BEGIN { exit !(estimate < maximum) }'; then
+      die "прогноз результата $(format_file_size "$ESTIMATED_BYTES") не меньше исходника $(format_file_size "$COMPARISON_SOURCE_BYTES"); выберите профиль ниже"
+    fi
+  fi
+
   STARTED="$(date +%s)"
 
   POSITION="0"
@@ -1623,7 +1752,7 @@ if [[ "$COMMAND" == "compress" ]]; then
     RESOURCE_ENCODER="Media Engine VT"
   fi
 
-  PROGRESS_PIPE="$(mktemp -u -t video-editor-progress.XXXXXX)"
+  PROGRESS_PIPE="${TEMP_OUTPUT:h}/progress"
   mkfifo "$PROGRESS_PIPE"
   TMP_FILES+=("$PROGRESS_PIPE")
 
@@ -1634,7 +1763,7 @@ if [[ "$COMMAND" == "compress" ]]; then
     -nostdin \
     -nostats \
     -stats_period 1 \
-    -progress "$PROGRESS_PIPE" \
+    -progress pipe:1 \
     "${INPUT_SEEK_ARGS[@]}" \
     -i "$INPUT" \
     "${INPUT_DURATION_ARGS[@]}" \
@@ -1648,7 +1777,7 @@ if [[ "$COMMAND" == "compress" ]]; then
     "${VIDEO_ARGS[@]}" \
     -fps_mode passthrough \
     "${MUXER_ARGS[@]}" \
-    "$TEMP_OUTPUT" > /dev/null 2>"$ERROR_LOG" &
+    "$TEMP_OUTPUT" >"$PROGRESS_PIPE" 2>"$ERROR_LOG" &
   FFMPEG_PID="$!"
 
   while IFS='=' read -r key value; do
@@ -1770,9 +1899,15 @@ if [[ "$COMMAND" == "compress" ]]; then
     exit "$FFMPEG_STATUS"
   fi
 
-  mv -f "$TEMP_OUTPUT" "$OUTPUT"
+  FINAL_BYTES="$(stat -f "%z" "$TEMP_OUTPUT" 2>/dev/null || true)"
+  if [[ "$FINAL_BYTES" =~ '^[0-9]+$' && "$COMPARISON_SOURCE_BYTES" =~ '^[0-9]+$' && \
+    "$COMPARISON_SOURCE_BYTES" -gt 0 && "$FINAL_BYTES" -ge "$COMPARISON_SOURCE_BYTES" ]]; then
+    rm -f "$TEMP_OUTPUT"
+    die "результат $(format_file_size "$FINAL_BYTES") не меньше исходника $(format_file_size "$COMPARISON_SOURCE_BYTES"); файл не сохранён"
+  fi
+  publish_output "$TEMP_OUTPUT" "$OUTPUT"
+OUTPUT="$REPLY"
   echo "Готово: $OUTPUT"
-  FINAL_BYTES="$(stat -f "%z" "$OUTPUT" 2>/dev/null || true)"
   FINAL_BITRATE_RAW="$(
     ffprobe -v error \
       -show_entries format=bit_rate \
@@ -1821,6 +1956,7 @@ else
   END_LABEL="$(safe_time_label "$END_SECONDS")"
   OUTPUT="$INPUT_DIR/$STEM.cut_${START_LABEL}_to_${END_LABEL}.$EXTENSION"
 fi
+[[ ! "$OUTPUT" -ef "$INPUT" && "${OUTPUT:A}" != "${INPUT:A}" ]] || die "результат не может заменять исходный файл"
 OUTPUT="$(unique_output_path "$OUTPUT")"
 
 OUTPUT_DIR="${OUTPUT:h}"
@@ -1829,9 +1965,11 @@ OUTPUT_DIR="${OUTPUT:h}"
 OUTPUT_NAME="${OUTPUT:t}"
 if [[ "$OUTPUT_NAME" == *.* ]]; then
   OUTPUT_EXTENSION="${OUTPUT_NAME##*.}"
-  TEMP_OUTPUT="${OUTPUT%.*}.tmp.$$.$OUTPUT_EXTENSION"
+  temporary_output "$OUTPUT"
+  TEMP_OUTPUT="$REPLY"
 else
-  TEMP_OUTPUT="$OUTPUT.tmp.$$.mkv"
+  temporary_output "$OUTPUT.mkv"
+  TEMP_OUTPUT="$REPLY"
 fi
 ERROR_LOG="$(mktemp -t video-editor.XXXXXX)"
 TMP_FILES+=("$TEMP_OUTPUT" "$ERROR_LOG")
@@ -1895,7 +2033,7 @@ RESOURCE_DISPLAY_STARTED=0
 OUTPUT_WRITE_RATE="--"
 PREVIOUS_TOTAL_SIZE="0"
 PREVIOUS_SIZE_TIME="$STARTED"
-PROGRESS_PIPE="$(mktemp -u -t video-editor-cut-progress.XXXXXX)"
+PROGRESS_PIPE="${TEMP_OUTPUT:h}/progress"
 mkfifo "$PROGRESS_PIPE"
 TMP_FILES+=("$PROGRESS_PIPE")
 
@@ -1906,7 +2044,7 @@ ffmpeg \
   -nostdin \
   -nostats \
   -stats_period 1 \
-  -progress "$PROGRESS_PIPE" \
+  -progress pipe:1 \
   -ss "$START_SECONDS" \
   -i "$INPUT" \
   -t "$CLIP_DURATION" \
@@ -1914,7 +2052,7 @@ ffmpeg \
   -map_metadata 0 \
   -c copy \
   -avoid_negative_ts make_zero \
-  "$TEMP_OUTPUT" >/dev/null 2>"$ERROR_LOG" &
+  "$TEMP_OUTPUT" >"$PROGRESS_PIPE" 2>"$ERROR_LOG" &
 FFMPEG_PID="$!"
 
 while IFS='=' read -r key value; do
@@ -2002,7 +2140,8 @@ if [[ "$FFMPEG_STATUS" != "0" ]]; then
   exit "$FFMPEG_STATUS"
 fi
 
-mv -f "$TEMP_OUTPUT" "$OUTPUT"
+publish_output "$TEMP_OUTPUT" "$OUTPUT"
+OUTPUT="$REPLY"
 echo "Готово: $OUTPUT"
 FINAL_BYTES="$(stat -f "%z" "$OUTPUT" 2>/dev/null || true)"
 [[ -n "$FINAL_BYTES" ]] && echo "Итоговый размер: $(format_file_size "$FINAL_BYTES")"

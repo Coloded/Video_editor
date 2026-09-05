@@ -22,12 +22,8 @@
 /Video_Editor.app/
 /VideoEditorMac/.build-dependencies/
 
-# Local standalone CLI helpers (not part of the macOS application source)
+# Local launcher (standalone CLI helpers are versioned for regression coverage)
 /video_editor
-/compress_video_for_mac.sh
-/convert_avi_for_mac.sh
-/extract_audio_from_video.sh
-/extract_end_segments.sh
 
 # Temporary FFmpeg output
 *.tmp.*
@@ -38,3 +34,7 @@
 
 # Local source media used only for testing
 /photo/
+
+# Local build and Python caches
+/dist/*.app/
+__pycache__/

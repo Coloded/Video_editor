@@ -54,7 +54,7 @@ done
 [[ -f "$RELEASE_NOTES" ]] || die "не найдено описание обновления: $RELEASE_NOTES"
 
 if [[ "$SKIP_BUILD" == "0" ]]; then
-  "$BUILD_SCRIPT"
+  "$BUILD_SCRIPT" --no-install
 fi
 
 APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$PLIST" 2>/dev/null || true)"
@@ -107,7 +107,9 @@ grep -Fq "<sparkle:version>$BUILD_VERSION</sparkle:version>" "$TEMP_DIR/appcast.
 grep -Fq "<sparkle:shortVersionString>$APP_VERSION</sparkle:shortVersionString>" "$TEMP_DIR/appcast.xml" || \
   die "appcast содержит неверную версию приложения"
 
-cp "$TEMP_DIR/appcast.xml" "$UPDATES_DIR/appcast.xml" || die "не удалось сохранить appcast.xml"
+python3 "$ROOT/validate_release.py" --appcast "$TEMP_DIR/appcast.xml" || die "проверка релиза не пройдена"
+cp "$TEMP_DIR/appcast.xml" "$UPDATES_DIR/appcast.xml.new"
+mv -f "$UPDATES_DIR/appcast.xml.new" "$UPDATES_DIR/appcast.xml" || die "не удалось сохранить appcast.xml"
 
 print -r -- "✓ Релиз Video Editor ${APP_VERSION} (build ${BUILD_VERSION}) подготовлен"
 print -r -- "$VERSIONED_DMG"

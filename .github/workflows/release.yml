@@ -28,7 +28,7 @@ jobs:
           hdiutil verify "dist/Video-Editor-${version}-arm64.dmg"
           hdiutil verify "dist/Video_Editor-stable.dmg"
           grep -Fq "Video_Editor-stable.dmg" updates/appcast.xml
-          grep -Fq "sparkle:edSignature=" updates/appcast.xml
+          python3 VideoEditorMac/validate_release.py
 
       - name: Publish GitHub Release
         env:
