@@ -913,6 +913,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private let fileField = NSTextField()
     private let browseButton = NSButton()
     private let profilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let formatPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let hdrRadio = NSButton(radioButtonWithTitle: "", target: nil, action: nil)
     private let sdrRadio = NSButton(radioButtonWithTitle: "", target: nil, action: nil)
     private let cpuCheckbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
@@ -945,6 +946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var pendingJoinURLs: [URL] = []
     private var joinEditButtons: [NSButton] = []
     private var profileRow: NSStackView!
+    private var formatRow: NSStackView!
     private var cutRow: NSStackView!
     private var previewStack: NSStackView!
     private var workspaceRow: NSStackView!
@@ -1158,7 +1160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private var localizationPairs: [(String, String)] {
         [
-            ("Файл", "File"), ("Профиль", "Profile"), ("Кодировщик", "Encoder"),
+            ("Файл", "File"), ("Профиль", "Profile"), ("Формат", "Format"), ("Кодировщик", "Encoder"),
             ("Время", "Time"), ("Старт", "Start"), ("Конец", "End"),
             ("Только CPU", "CPU only"), ("Обзор…", "Browse…"), ("Добавить…", "Add…"),
             ("Порядок сверху вниз", "Order top to bottom"), ("Показать", "Show"),
@@ -1371,6 +1373,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         profileControls.alignment = .centerY
         profileControls.spacing = 12
         profileRow = makeLabeledRow(title: text("Профиль", "Profile"), control: profileControls)
+
+        formatPopup.addItems(withTitles: compressedOutputExtensions.map { "\($0.uppercased()) (.\($0))" })
+        formatPopup.selectItem(at: 0)
+        formatPopup.controlSize = .large
+        formatPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        formatRow = makeLabeledRow(title: text("Формат", "Format"), control: formatPopup)
 
         cpuCheckbox.title = text("Только CPU", "CPU only")
         cpuCheckbox.toolTip = text("Отключить Apple VideoToolbox и кодировать процессором", "Disable Apple VideoToolbox and encode on the CPU")
@@ -1634,11 +1642,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         selectionLabel.textColor = .secondaryLabelColor
         selectionLabel.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .regular)
         selectionLabel.alignment = .right
-        let editorControlsStack = NSStackView(views: [fileRow, profileRow, cpuRow, joinStack, cutRow])
+        let editorControlsStack = NSStackView(views: [fileRow, profileRow, formatRow, cpuRow, joinStack, cutRow])
         editorControlsStack.orientation = .vertical
         editorControlsStack.alignment = .leading
         editorControlsStack.spacing = 13
-        for view in [fileRow, profileRow!, cpuRow, joinStack!, cutRow!] {
+        for view in [fileRow, profileRow!, formatRow!, cpuRow, joinStack!, cutRow!] {
             view.widthAnchor.constraint(equalTo: editorControlsStack.widthAnchor).isActive = true
         }
         workspaceRow = NSStackView(views: [editorControlsStack, playerView])
@@ -2002,6 +2010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let editing = mode == .cut || mode == .join
         let joining = mode == .join
         profileRow.isHidden = editing
+        formatRow.isHidden = mode == .cut
         row(withIdentifier: "cpuRow")?.isHidden = mode == .cut
         joinStack.isHidden = !joining
         cutRow.isHidden = !editing
@@ -2060,7 +2069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let targetMinSize: NSSize
         switch mode {
         case .compress:
-            desiredHeight = 470
+            desiredHeight = 510
             desiredWidth = 720
             targetMinSize = NSSize(width: 600, height: 420)
             playerHeightConstraint.constant = 240
@@ -3824,6 +3833,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         return String(format: "%02d:%06.3f", minutes, seconds)
     }
 
+    private var selectedOutputExtension: String {
+        let index = formatPopup.indexOfSelectedItem
+        return compressedOutputExtensions.indices.contains(index) ? compressedOutputExtensions[index] : "mp4"
+    }
+
+    private func configureVideoSavePanel(_ panel: NSSavePanel, stem: String) {
+        let ext = selectedOutputExtension
+        panel.nameFieldStringValue = "\(stem).\(ext)"
+        panel.allowedContentTypes = contentTypes(for: [ext])
+        panel.allowsOtherFileTypes = false
+        panel.isExtensionHidden = false
+        panel.canSelectHiddenExtension = false
+    }
+
+    private func videoOutputURL(_ proposed: URL) -> URL {
+        guard proposed.pathExtension.lowercased() != selectedOutputExtension else { return proposed }
+        return proposed.deletingPathExtension().appendingPathExtension(selectedOutputExtension)
+    }
+
     @objc private func startWork(_ sender: Any?) {
         guard !isRunningJob, !isPreparingJoinClips, !isPreparingAudio else { return }
         if mode == .join || mode == .cut {
@@ -3890,8 +3918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
             let profile = availableProfiles[profilePopup.indexOfSelectedItem]
             savePanel.title = text("Куда сохранить сжатое видео", "Save compressed video")
-            savePanel.nameFieldStringValue = "\(stem).\(profile.suffix).mp4"
-            savePanel.allowedContentTypes = contentTypes(for: compressedOutputExtensions)
+            configureVideoSavePanel(savePanel, stem: "\(stem).\(profile.suffix)")
         case .cut:
             let ext = inputURL.pathExtension.isEmpty ? "mkv" : inputURL.pathExtension
             savePanel.title = text("Куда сохранить фрагмент", "Save clip")
@@ -3899,8 +3926,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             savePanel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .audiovisualContent]
         case .join:
             savePanel.title = text("Куда сохранить склеенное видео", "Save joined video")
-            savePanel.nameFieldStringValue = "\(stem).joined.mp4"
-            savePanel.allowedContentTypes = contentTypes(for: compressedOutputExtensions)
+            configureVideoSavePanel(savePanel, stem: "\(stem).joined")
         }
 
         guard savePanel.runModal() == .OK, var outputURL = savePanel.url else { return }
@@ -3933,9 +3959,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
 
-        if mode == .compress || mode == .join,
-           !compressedOutputExtensions.contains(outputURL.pathExtension.lowercased()) {
-            outputURL = outputURL.deletingPathExtension().appendingPathExtension("mp4")
+        if mode == .compress || mode == .join {
+            outputURL = videoOutputURL(outputURL)
         }
 
         beginProcess(inputURL: inputURL, outputURL: outputURL)
@@ -4439,6 +4464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         modeControl.isEnabled = !running
         browseButton.isEnabled = !running
         profilePopup.isEnabled = !running && !availableProfiles.isEmpty
+        formatPopup.isEnabled = !running
         let supportsHDRChoice = sourceInfo?.isHDR == true || sourceInfo?.isHighBitDepth == true
         hdrRadio.isEnabled = !running && supportsHDRChoice
         sdrRadio.isEnabled = !running && supportsHDRChoice

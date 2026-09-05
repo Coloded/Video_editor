@@ -3,6 +3,18 @@
 extension AppDelegate {
     func runRegressionTests(source: URL) {
         configureWindow()
+        precondition(formatPopup.itemTitles == ["MP4 (.mp4)", "MOV (.mov)", "MKV (.mkv)"])
+        precondition(selectedOutputExtension == "mp4")
+        for (index, ext) in ["mp4", "mov", "mkv"].enumerated() {
+            formatPopup.selectItem(at: index)
+            let panel = NSSavePanel()
+            configureVideoSavePanel(panel, stem: "clip.1080p")
+            precondition(panel.nameFieldStringValue == "clip.1080p.\(ext)")
+            precondition(panel.allowedContentTypes == contentTypes(for: [ext]))
+            precondition(!panel.allowsOtherFileTypes && !panel.isExtensionHidden)
+            precondition(videoOutputURL(URL(fileURLWithPath: "/tmp/clip.mp4")).pathExtension == ext)
+        }
+        formatPopup.selectItem(at: 0)
         for bad in ["inf", "nan", "1::30", "1:-30", "-1", "1:60", "999999999999999999999", "1e20", ""] {
             precondition(parseTime(bad) == nil, "Invalid time accepted: \(bad)")
         }
@@ -37,12 +49,14 @@ extension AppDelegate {
         precondition(joinClips[0].volume == 0 && joinClips[0].audioDetached)
         precondition(overlayAudioTable.enclosingScrollView?.superview != nil, "Audio list is inaccessible")
         setRunning(true)
+        precondition(!formatPopup.isEnabled)
         precondition(!editorTimelineView.isEnabled && !clipVolumeSlider.isEnabled && !overlayVolumeSlider.isEnabled)
         precondition(editorContextMenu(for: .video(0), projectTime: 0) == nil)
         let previous = joinClips[0].lowerValue
         trimVideoFromEditorTimeline(index: 0, start: 0.1, end: 0.5)
         precondition(joinClips[0].lowerValue == previous, "Editing during export")
         setRunning(false)
+        precondition(formatPopup.isEnabled)
         trimVideoFromEditorTimeline(index: 0, start: -0.1, end: 0.5)
         precondition(joinClips[0].lowerValue == previous)
         trimVideoFromEditorTimeline(index: 0, start: 0, end: 0.025)

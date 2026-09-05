@@ -3,23 +3,21 @@
     <channel>
         <title>Video_Editor</title>
         <item>
-            <title>3.9.0</title>
-            <pubDate>Sat, 05 Sep 2026 10:30:54 +0300</pubDate>
+            <title>3.9.1</title>
+            <pubDate>Sat, 05 Sep 2026 23:03:16 +0300</pubDate>
             <link>https://github.com/Coloded/Video_editor</link>
-            <sparkle:version>19</sparkle:version>
-            <sparkle:shortVersionString>3.9.0</sparkle:shortVersionString>
+            <sparkle:version>20</sparkle:version>
+            <sparkle:shortVersionString>3.9.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description sparkle:format="markdown"><![CDATA[# Video Editor 3.9.0
+            <description sparkle:format="markdown"><![CDATA[# Video Editor 3.9.1
 
-- Правый клик по видео: разрезание в точке клика и скорость ×1, ×2–×10, ÷2–÷10.
-- Скорость согласована в таймлайне, предпросмотре, звуке и экспорте.
-- Сохранение проектов, автоматическая копия и восстановление последнего монтажа.
-- Безопасное сохранение видео и звука, исправления отмены, отделения звука, коротких клипов и ввода времени.
-- Исправлены HDR → SDR, поворот видео и выбор перекрывающихся звуковых дорожек.
-- Дополнительные проверки сборки, зависимостей и подписи обновлений.
+- Под профилем добавлен выпадающий список «Формат»: MP4, MOV, MKV.
+- Выбор доступен и при сжатии, и в редакторе. MP4 выбран по умолчанию.
+- Окно сохранения автоматически подставляет нужное расширение. Ручное переименование не требуется.
+- Проверен реальный экспорт во все три контейнера.
 ]]></description>
-            <enclosure url="https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg" length="3648808" type="application/octet-stream" sparkle:edSignature="/2J/NVjlj9RUIopTfHYMsBnwPi3kk7jmo/ExawKtKHx+VgqV1FvkHBuVdGRAAm9FUmcwjYs9MLsPHb8PGcboDQ=="/>
+            <enclosure url="https://github.com/Coloded/Video_editor/releases/latest/download/Video_Editor-stable.dmg" length="3650936" type="application/octet-stream" sparkle:edSignature="rjBmaFKKMYOnDANf9G1MZc8faU2TvAAV829rcW2mOadxsoZCRgIRsh2Vngt1TMqrCIFzZFH9f005rVM33QFFBQ=="/>
         </item>
     </channel>
 </rss>

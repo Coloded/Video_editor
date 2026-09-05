@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
 import os
+import plistlib
 from pathlib import Path
 import subprocess
 import sys
@@ -72,7 +73,8 @@ class AnalysisTests(unittest.TestCase):
             (root / 'VideoEditorMac').mkdir()
             (root / 'VideoEditorMac/Info.plist').write_bytes((ROOT / 'VideoEditorMac/Info.plist').read_bytes())
             (root / 'dist/Video_Editor-stable.dmg').write_bytes(b'A')
-            (root / 'dist/Video-Editor-3.9.0-arm64.dmg').write_bytes(b'B')
+            version = plistlib.loads((ROOT / 'VideoEditorMac/Info.plist').read_bytes())['CFBundleShortVersionString']
+            (root / f'dist/Video-Editor-{version}-arm64.dmg').write_bytes(b'B')
             module.ROOT, module.WORKSPACE = root / 'VideoEditorMac', root
             with self.assertRaisesRegex(ValueError, 'differ'):
                 module.validate(root / 'unused.xml', check_bundle=False)

@@ -50,6 +50,22 @@ class EngineTests(unittest.TestCase):
                       '--plain-progress', '-o', output, *extra])
         return result, output
 
+    def test_output_containers(self):
+        manifest = self.root / 'formats.tsv'
+        manifest.write_text(f'{self.source}\t0\t2\t1\t1\n')
+        for ext in ['mp4', 'mov', 'mkv']:
+            with self.subTest(container=ext):
+                output = self.root / f'container.{ext}'
+                result = run([ENGINE, 'join', '--manifest', manifest, '--no-gpu', '--convert-sdr', '--plain-progress', '-o', output])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                metadata = self.probe(output)
+                self.assertEqual([s['codec_name'] for s in metadata['streams']], ['h264', 'aac'])
+                self.assertAlmostEqual(float(metadata['format']['duration']), 2, delta=0.15)
+                self.assertIn('matroska' if ext == 'mkv' else 'mov', metadata['format']['format_name'])
+                if ext in ['mp4', 'mov']:
+                    # ffprobe groups the two ISO-BMFF containers; the brand distinguishes them.
+                    self.assertEqual(metadata['format']['tags']['major_brand'], 'qt  ' if ext == 'mov' else 'isom')
+
     def test_speed_and_audio(self):
         for speed in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0.5, 0.1]:
             with self.subTest(speed=speed):
@@ -154,11 +170,12 @@ class EngineTests(unittest.TestCase):
                       'testsrc2=s=480x240:r=30:d=1,setparams=color_trc=arib-std-b67:color_primaries=bt2020:colorspace=bt2020nc',
                       '-c:v', 'ffv1', '-pix_fmt', 'yuv420p10le', source])
         self.assertEqual(result.returncode, 0, result.stderr)
-        output = self.root / 'compressed-hdr.mp4'
-        result = run([ENGINE, 'compress', '240', '-f', source, '--no-gpu', '--convert-sdr', '--plain-progress', '-o', output])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.probe(output)['streams'][0]['color_transfer'], 'bt709')
-        self.assertLess(output.stat().st_size, source.stat().st_size)
+        for ext in ['mp4', 'mov', 'mkv']:
+            output = self.root / f'compressed-hdr.{ext}'
+            result = run([ENGINE, 'compress', '240', '-f', source, '--no-gpu', '--convert-sdr', '--plain-progress', '-o', output])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.probe(output)['streams'][0]['color_transfer'], 'bt709')
+            self.assertLess(output.stat().st_size, source.stat().st_size)
 
     def test_rotation(self):
         rotated = self.root / 'rotated.mp4'
