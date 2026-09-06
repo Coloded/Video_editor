@@ -37,7 +37,7 @@ extension AppDelegate {
         let restored = try! JSONDecoder().decode(CompressionProfile.self, from: JSONEncoder().encode(custom))
         precondition(restored.valid && restored.custom && restored.standardBitrate == 0.5)
         sourceInfo = camera
-        precondition(compressionArguments(restored).contains("--allow-larger"))
+        precondition(!compressionArguments(restored).contains("--allow-larger"))
         editor.bitrate.stringValue = "nan"; editor.changed()
         precondition(editor.result == nil && !editor.alert.buttons[0].isEnabled)
         editor.resetProfile()
@@ -55,6 +55,114 @@ extension AppDelegate {
         customProfiles = [override]
         precondition(compressionProfiles(for: camera).filter { $0.id == compact.id }.count == 1)
         customProfiles = []
+        availableProfiles = [compact]
+        profilePopup.removeAllItems(); profilePopup.addItem(withTitle: compact.title); profilePopup.selectItem(at: 0)
+        processLine("[####] 50% | файл 12 МБ -> итог ~24 МБ", isError: false)
+        precondition(sourceSummaryLabel.stringValue.contains("1920×1080"))
+        precondition(estimateLabel.stringValue.contains("1280×720"))
+        precondition(estimateLabel.stringValue.contains("24 МБ (прогноз)"))
+        processLine("Итоговый размер: 340 МБ → 23 МБ · экономия 93%", isError: false)
+        precondition(estimateLabel.stringValue.contains("Размер: 23 МБ"))
+        processLine("Видео: HEVC, VideoToolbox", isError: false)
+        precondition(!technicalLabel.isHidden && !technicalHeading.isHidden && sizeLabel.isHidden)
+        var multi = camera
+        multi.audioTracks = [CompressionAudioTrack(index: 1, title: "Russian", bitrate: 640000), CompressionAudioTrack(index: 2, title: "English", bitrate: 448000)]
+        sourceInfo = multi
+        refreshCompressionAudio()
+        let audioButton = audioTracksList.arrangedSubviews[0] as! NSButton
+        audioButton.state = .off; changeCompressionAudio(audioButton)
+        precondition(excludedAudioTracks == [1])
+        precondition(compressionArguments(compact).suffix(3) == ["--select-audio", "--audio-track", "2"])
+        precondition(compressionProfiles(for: multi).first?.id == "copy")
+        precondition(compressionArguments(originalProfile).prefix(3) == ["compress", "--profile", "copy"])
+        let small = SourceInfo(width: 720, height: 256, fps: 23.976, videoBitrate: 2,
+            codec: "mpeg4", pixelFormat: "yuv420p", colorTransfer: "bt709", duration: 8000, hasAudio: true)
+        let movieSize = source.deletingLastPathComponent().appendingPathComponent("movie-size.bin")
+        FileManager.default.createFile(atPath: movieSize.path, contents: nil)
+        let movieHandle = try! FileHandle(forWritingTo: movieSize)
+        try! movieHandle.truncate(atOffset: 2_345_600_000); try! movieHandle.close()
+        selectedInputURL = movieSize
+        sourceInfo = small
+        preferredProfileID = compact.id
+        applyAvailableProfiles(for: small)
+        precondition(preferredProfileID == compact.id)
+        precondition(profilePopup.numberOfItems == 18)
+        precondition(profilePopup.itemArray.filter { $0.isEnabled }.count == 11)
+        for (index, profile) in availableProfiles.enumerated() where profile.id != "copy" {
+            precondition(profilePopup.item(at: index)!.isEnabled == (estimatedProfileMB(profile, info: small) < sourceSizeMB))
+            precondition(profile.outputShortSide(for: small) <= 256)
+        }
+        precondition(compact.dimensions(for: small) == "720×256")
+        let args = compressionArguments(compact)
+        precondition(args[args.firstIndex(of: "--short-side")! + 1] == "256")
+        var excessive = compact
+        excessive.fps = 60
+        precondition(profileRestriction(excessive, info: small) == nil)
+        precondition(!compressionArguments(excessive).contains("--fps"))
+        precondition(excessive.outputFPS(for: small) == 23.976)
+        profileModeControl.selectedSegment = 2
+        profileModeChanged(profileModeControl)
+        precondition(profilePopup.itemArray.filter { $0.isEnabled }.count == 4)
+        precondition(rutubeProfiles[0].standardBitrate == 0.3)
+        profileModeControl.selectedSegment = 1
+        profileModeChanged(profileModeControl)
+        precondition(profilePopup.itemArray.filter { $0.isEnabled }.count == 3)
+        profileModeControl.selectedSegment = 0
+        profileModeChanged(profileModeControl)
+        restoreCompressionAudio()
+        precondition(excludedAudioTracks.isEmpty)
+        selectedInputURL = nil
+        // YouTube uses a separate catalog, original fps and the same size/resolution guards.
+        let sizedSource = source.deletingLastPathComponent().appendingPathComponent("size-only.bin")
+        FileManager.default.createFile(atPath: sizedSource.path, contents: nil)
+        let handle = try! FileHandle(forWritingTo: sizedSource)
+        try! handle.truncate(atOffset: 1_000_000_000); try! handle.close()
+        selectedInputURL = sizedSource
+        let upload = SourceInfo(width: 1920, height: 1080, fps: 30, videoBitrate: 10, codec: "h264", pixelFormat: "yuv420p", colorTransfer: "bt709", duration: 900, hasAudio: false)
+        sourceInfo = upload
+        profileModeControl.selectedSegment = 1
+        profileModeChanged(profileModeControl)
+        precondition(modeControl.segmentCount == 2 && profileModeControl.segmentCount == 3)
+        precondition(mode == .compress && isYouTubeMode)
+        precondition(youtubeProfiles.count == 8 && youtubeProfiles.allSatisfy(\.valid))
+        precondition(youtubeProfiles.last!.highFPSBitrate == 180)
+        preferredProfileID = "copy"
+        applyAvailableProfiles(for: upload)
+        precondition(profilePopup.numberOfItems == 9)
+        let originalIndex = availableProfiles.firstIndex { $0.id == "copy" }!
+        precondition(originalIndex == 5 && profilePopup.indexOfSelectedItem == originalIndex)
+        precondition(availableProfiles[originalIndex - 1].targetShortSide == 1080)
+        precondition(availableProfiles[originalIndex + 1].targetShortSide == 1440)
+        precondition(profilePopup.item(at: originalIndex - 1)!.isEnabled)
+        precondition(!profilePopup.item(at: originalIndex + 1)!.isEnabled)
+        var expensive = youtubeProfiles[4]
+        expensive = CompressionProfile(id: "expensive", title: "Expensive", suffix: "test", targetShortSide: 720,
+            standardBitrate: 100, highFPSBitrate: 100, videoCodec: "h264")
+        precondition(profileRestriction(expensive, info: upload) != nil)
+        profilePopup.selectItem(at: originalIndex - 1); profileChanged(profilePopup)
+        precondition(selectedOutputExtension == "mp4")
+        precondition(compressionArguments(youtubeProfiles[4]).contains("384"))
+        precondition(!compressionArguments(youtubeProfiles[4]).contains("--fps"))
+        applyAvailableProfiles(for: upload)
+        precondition(preferredProfileID == "yt-sdr-1080")
+        profileModeControl.selectedSegment = 2
+        profileModeChanged(profileModeControl)
+        precondition(rutubeProfiles.count == 8 && rutubeProfiles.allSatisfy(\.valid))
+        precondition(availableProfiles.filter { $0.id.hasPrefix("rt-sdr-") }.count == 8)
+        precondition(!availableProfiles.contains { $0.id.hasPrefix("yt-sdr-") })
+        precondition(rutubeProfiles.last!.targetShortSide == 2160)
+        precondition(compressionArguments(rutubeProfiles[5]).contains("128"))
+        profileModeControl.selectedSegment = 1
+        profileModeChanged(profileModeControl)
+        precondition(preferredProfileID == "yt-sdr-1080")
+        setRunning(true)
+        precondition(!profileModeControl.isEnabled)
+        setRunning(false)
+        precondition(profileModeControl.isEnabled)
+        profileModeControl.selectedSegment = 0
+        profileModeChanged(profileModeControl)
+        precondition(!compressionProfiles(for: upload).contains { $0.id.hasPrefix("yt-sdr-") })
+        selectedInputURL = nil
         sourceInfo = nil
         modeControl.selectedSegment = EditorMode.join.rawValue
         joinClips = [JoinClip(id: UUID(), url: source, info: info, lowerValue: 0, upperValue: 2, thumbnails: [], volume: 0.4, waveform: [0.1, 1, 0.2], speed: 2)]

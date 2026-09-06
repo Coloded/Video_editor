@@ -95,16 +95,24 @@ private struct CompressionProfile: Codable {
     var custom: Bool = false
 
     func bitrate(for info: SourceInfo, preserveHDR: Bool) -> Double {
-        let value = info.fps > 30.5 ? highFPSBitrate : standardBitrate
+        let value = outputFPS(for: info) > 30.5 ? highFPSBitrate : standardBitrate
         return preserveHDR && videoCodec == "h264" ? value * 0.6 : value
     }
     func estimateMB(for info: SourceInfo, preserveHDR: Bool) -> Double {
         let audio = info.hasAudio && audioMode != "remove" ? Double(audioBitrate) / 1000 : 0
         return info.duration * (bitrate(for: info, preserveHDR: preserveHDR) + audio) / 8 * 1.01
     }
+    func outputShortSide(for info: SourceInfo) -> Int {
+        max(2, min(targetShortSide, info.shortSide) / 2 * 2)
+    }
+    func outputFPS(for info: SourceInfo) -> Double {
+        fps > 0 ? min(Double(fps), info.fps) : info.fps
+    }
     func dimensions(for info: SourceInfo) -> String {
-        let longSide = Int((Double(max(info.width, info.height)) * Double(targetShortSide) / Double(info.shortSide) / 2).rounded()) * 2
-        return info.width >= info.height ? "\(longSide)×\(targetShortSide)" : "\(targetShortSide)×\(longSide)"
+        let side = outputShortSide(for: info)
+        let sourceLong = max(info.width, info.height)
+        let longSide = min(sourceLong / 2 * 2, Int((Double(sourceLong) * Double(side) / Double(info.shortSide) / 2).rounded()) * 2)
+        return info.width >= info.height ? "\(longSide)×\(side)" : "\(side)×\(longSide)"
     }
     var valid: Bool {
         !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && title.count <= 100 &&
@@ -112,7 +120,7 @@ private struct CompressionProfile: Codable {
         standardBitrate.isFinite && highFPSBitrate.isFinite &&
         (0.05...200).contains(standardBitrate) && (0.05...200).contains(highFPSBitrate) &&
         ["h264", "hevc"].contains(videoCodec) && [0,15,24,25,30,50,60].contains(fps) &&
-        ["aac", "remove"].contains(audioMode) && (32...320).contains(audioBitrate) &&
+        ["aac", "remove"].contains(audioMode) && (32...512).contains(audioBitrate) &&
         ["auto", "cpu", "hardware"].contains(encoder) && ["auto", "sdr", "hdr"].contains(color) &&
         ["mp4", "mov", "mkv"].contains(container)
     }
@@ -248,12 +256,28 @@ private final class ProfileEditor: NSObject, NSTextFieldDelegate {
         let p = result
         for index in [0,1,3] where alert.buttons.indices.contains(index) { alert.buttons[index].isEnabled = p != nil }
         guard let p else {
-            estimate.stringValue = "Укажите название, чётную короткую сторону 128–4320 px, битрейт 0,05–200 Мбит/с и звук 32–320 кбит/с."
+            estimate.stringValue = "Укажите название, чётную короткую сторону 128–4320 px, битрейт 0,05–200 Мбит/с и звук 32–512 кбит/с."
             return
         }
         let size = p.estimateMB(for: info, preserveHDR: preserve)
-        estimate.stringValue = p.dimensions(for: info) + " · " + (p.fps == 0 ? "исходная частота кадров" : "\(p.fps) fps") + "\n" + String(format: "Исходник: %.1f МБ → расчёт: ≈%.1f МБ\n%@", sourceMB, size, size >= sourceMB ? "Внимание: файл может стать больше исходника." : "При фиксированном битрейте разрешение и контейнер почти не меняют размер.")
+        estimate.stringValue = p.dimensions(for: info) + " · " + String(format: "%.3f fps", p.outputFPS(for: info)) + "\n" + String(format: "Исходник: %.1f МБ → расчёт: ≈%.1f МБ\n%@", sourceMB, size, size >= sourceMB ? "Внимание: файл может стать больше исходника." : "При фиксированном битрейте разрешение и контейнер почти не меняют размер.")
     }
+}
+
+private struct CompressionAudioTrack {
+    let index: Int
+    let title: String
+    let bitrate: Double
+}
+private final class CompressionAudioButton: NSButton {
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard isEnabled else { return nil }
+        let menu = NSMenu()
+        let item = NSMenuItem(title: state == .on ? "Исключить из результата" : "Восстановить дорожку", action: #selector(toggleTrack), keyEquivalent: "")
+        item.target = self; menu.addItem(item)
+        return menu
+    }
+    @objc private func toggleTrack() { state = state == .on ? .off : .on; _ = sendAction(action, to: target) }
 }
 
 private struct SourceInfo {
@@ -266,6 +290,7 @@ private struct SourceInfo {
     let colorTransfer: String
     let duration: Double
     let hasAudio: Bool
+    var audioTracks: [CompressionAudioTrack] = []
 
     var shortSide: Int { min(width, height) }
     var isHDR: Bool { colorTransfer == "smpte2084" || colorTransfer == "arib-std-b67" }
@@ -1065,10 +1090,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         CompressionProfile(id: "youtube", title: "YouTube 4K SDR", suffix: "youtube", targetShortSide: 2160, standardBitrate: 40, highFPSBitrate: 60, videoCodec: "h264"),
         CompressionProfile(id: "youtube-compact", title: "YouTube 4K Compact  -  HEVC", suffix: "youtube-compact", targetShortSide: 2160, standardBitrate: 24, highFPSBitrate: 36, videoCodec: "hevc")
     ]
+    private let audioTracksSection = NSStackView()
+    private let audioTracksList = NSStackView()
+    private let audioTracksHeading = NSButton()
+    private let restoreAudioButton = NSButton()
+    private var excludedAudioTracks = Set<Int>()
     private var customProfiles: [CompressionProfile] = []
     private var oneTimeProfile: CompressionProfile?
     private let editProfileButton = NSButton()
     private let estimateLabel = NSTextField(wrappingLabelWithString: "")
+    private let sourceSummaryLabel = NSTextField(wrappingLabelWithString: "")
+    private let comparisonRow = NSStackView()
+    private let technicalHeading = NSTextField(labelWithString: "Техническая информация")
     private let compactProfiles: [CompressionProfile] = [
         CompressionProfile(id: "compact-240-hevc-0.2", title: "Минимальный · 240p", suffix: "240p-compact", targetShortSide: 240, standardBitrate: 0.2, highFPSBitrate: 0.2, videoCodec: "hevc"),
         CompressionProfile(id: "compact-360-hevc-0.35", title: "Компактный · 360p", suffix: "360p-compact", targetShortSide: 360, standardBitrate: 0.35, highFPSBitrate: 0.35, videoCodec: "hevc"),
@@ -1080,7 +1113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         CompressionProfile(id: "compact-720-h264-1.5", title: "Совместимый HD · 720p", suffix: "720p-compact", targetShortSide: 720, standardBitrate: 1.5, highFPSBitrate: 1.5, videoCodec: "h264")
     ]
     private var availableProfiles: [CompressionProfile] = []
-    private var preferredProfileID = "1080"
+    private let originalProfile = CompressionProfile(id: "copy", title: "Исходное качество · без перекодирования", suffix: "tracks", targetShortSide: 0, standardBitrate: 0, highFPSBitrate: 0, videoCodec: "copy")
+    private var preferredProfileID = "copy"
     private var sourceInfo: SourceInfo?
     private var analysisToken = UUID()
     private var previewToken = UUID()
@@ -1092,6 +1126,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         target: nil,
         action: nil
     )
+    private let profileModeControl = NSSegmentedControl(labels: ["Основной", "YouTube", "RUTUBE"], trackingMode: .selectOne, target: nil, action: nil)
+    private var profileModeRow: NSStackView!
+    private var profileModeSelections: [Int: String] = [:]
+    private var previousProfileMode = 0
     private let fileField = NSTextField()
     private let browseButton = NSButton()
     private let profilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -1178,8 +1216,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var wasCancelled = false
     private var resultPublished = false
 
+    private var isYouTubeMode: Bool { profileModeControl.selectedSegment == 1 }
+    private var isPlatformMode: Bool { profileModeControl.selectedSegment > 0 }
     private var mode: EditorMode {
         EditorMode(rawValue: modeControl.selectedSegment) ?? .compress
+    }
+
+    // Upload bitrates from YouTube Help (SDR); 240p is an application preset.
+    private var youtubeProfiles: [CompressionProfile] {
+        let settings: [(Int, Double, Double)] = [(240, 0.6, 0.9), (360, 1, 1.5),
+            (480, 2.5, 4), (720, 5, 7.5), (1080, 8, 12), (1440, 16, 24),
+            (2160, 40, 60), (4320, 120, 180)]
+        return settings.map { side, standard, high in
+            CompressionProfile(id: "yt-sdr-\(side)", title: "YouTube · \(side)p" + (side == 240 ? " · наш профиль" : ""),
+                suffix: "youtube-\(side)p", targetShortSide: side, standardBitrate: standard,
+                highFPSBitrate: high, videoCodec: "h264", audioBitrate: 384, color: "sdr")
+        }
+    }
+
+    // Application presets: RUTUBE publishes general upload requirements, not a bitrate ladder.
+    private var rutubeProfiles: [CompressionProfile] {
+        let settings: [(Int, Double, Double)] = [(144, 0.3, 0.45), (240, 0.6, 0.9), (360, 1, 1.5),
+            (480, 2.5, 4), (720, 5, 7.5), (1080, 8, 12), (1440, 16, 24), (2160, 40, 60)]
+        return settings.map { side, standard, high in
+            CompressionProfile(id: "rt-sdr-\(side)", title: "RUTUBE · \(side)p", suffix: "rutube-\(side)p",
+                targetShortSide: side, standardBitrate: standard, highFPSBitrate: high,
+                videoCodec: "h264", audioBitrate: 128, color: "sdr")
+        }
+    }
+
+    private var modeBuiltinProfiles: [CompressionProfile] {
+        switch profileModeControl.selectedSegment {
+        case 1: return youtubeProfiles
+        case 2: return rutubeProfiles
+        default: return compactProfiles + profiles
+        }
+    }
+
+    @objc private func profileModeChanged(_ sender: NSSegmentedControl) {
+        guard !isRunningJob else { sender.selectedSegment = previousProfileMode; return }
+        profileModeSelections[previousProfileMode] = preferredProfileID
+        previousProfileMode = sender.selectedSegment
+        preferredProfileID = profileModeSelections[previousProfileMode] ?? "copy"
+        oneTimeProfile = nil
+        rawEngineSizeText = nil
+        if let info = sourceInfo {
+            applyAvailableProfiles(for: info)
+            profileChanged(profilePopup)
+        } else {
+            availableProfiles = [originalProfile] + modeBuiltinProfiles
+            profilePopup.removeAllItems()
+            profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
+            profilePopup.selectItem(at: 0)
+            profilePopup.isEnabled = false
+        }
     }
 
     private func text(_ russian: String, _ english: String) -> String {
@@ -1191,12 +1281,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func profileTitle(_ profile: CompressionProfile) -> String {
+        if profile.id == "copy" {
+            guard let info = sourceInfo else { return profile.title }
+            return String(format: "Исходное качество · %d×%d · %@ · %.3f fps · без перекодирования", info.width, info.height, info.codec.uppercased(), info.fps)
+        }
         let preserve = sourceInfo.map { ($0.isHDR || $0.isHighBitDepth) && hdrRadio.state == .on } ?? false
         let rate = sourceInfo.map { profile.bitrate(for: $0, preserveHDR: preserve) } ?? profile.standardBitrate
         let codec = preserve || profile.videoCodec == "hevc" ? "HEVC" : "H.264"
-        let name = profile.title.components(separatedBy: "  -  ").first ?? profile.title
-        let size = sourceInfo.map { String(format: " · ≈%.0f МБ", profile.estimateMB(for: $0, preserveHDR: preserve)) } ?? ""
-        return "\(name) · \(codec) · \(String(format: "%.2g", rate)) Мбит/с\(size)"
+        let originalName = profile.title.components(separatedBy: "  -  ").first ?? profile.title
+        let name = originalName.replacingOccurrences(of: "(?<!до )([0-9]+p)", with: "до $1", options: .regularExpression)
+        let size = sourceInfo.map { String(format: " · ≈%.0f МБ", estimatedProfileMB(profile, info: $0)) } ?? ""
+        return "\(name) · \(codec) · \(rate.formatted(.number.precision(.fractionLength(0...3)))) Мбит/с\(size)"
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1394,6 +1489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func applyLanguage() {
         configureMenu()
+        profileModeControl.setLabel(text("Основной", "Main"), forSegment: 0)
         modeControl.setLabel(text("Сжатие", "Compress"), forSegment: EditorMode.compress.rawValue)
         modeControl.setLabel(text("Редактор", "Editor"), forSegment: EditorMode.join.rawValue)
 
@@ -1438,6 +1534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             let selectedIndex = profilePopup.indexOfSelectedItem
             profilePopup.removeAllItems()
             profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
+        updateProfileAvailability()
             if availableProfiles.indices.contains(selectedIndex) {
                 profilePopup.selectItem(at: selectedIndex)
             }
@@ -1484,6 +1581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         titleLabel.font = .systemFont(ofSize: 27, weight: .semibold)
 
         modeControl.selectedSegment = EditorMode.compress.rawValue
+        profileModeControl.setLabel(text("Основной", "Main"), forSegment: 0)
         modeControl.setLabel(text("Сжатие", "Compress"), forSegment: EditorMode.compress.rawValue)
         modeControl.setLabel(text("Редактор", "Editor"), forSegment: EditorMode.join.rawValue)
         modeControl.target = self
@@ -1523,8 +1621,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         fileControls.spacing = 10
         let fileRow = makeLabeledRow(title: text("Файл", "File"), control: fileControls)
 
+        profileModeControl.selectedSegment = 0
+        profileModeControl.controlSize = .large
+        profileModeControl.target = self
+        profileModeControl.action = #selector(profileModeChanged(_:))
+        profileModeRow = makeLabeledRow(title: text("Режим", "Mode"), control: profileModeControl)
         availableProfiles = profiles
         profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
+        updateProfileAvailability()
         profilePopup.selectItem(at: 4)
         profilePopup.target = self
         profilePopup.action = #selector(profileChanged(_:))
@@ -1554,6 +1658,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         profilePopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         profileRow = makeLabeledRow(title: text("Профиль", "Profile"), control: profileControls)
 
+        audioTracksHeading.bezelStyle = .rounded
+        audioTracksHeading.target = self; audioTracksHeading.action = #selector(toggleAudioTracks)
+        restoreAudioButton.title = "Восстановить все"
+        restoreAudioButton.bezelStyle = .rounded
+        restoreAudioButton.target = self; restoreAudioButton.action = #selector(restoreCompressionAudio)
+        let compressionAudioHeader = NSStackView(views: [audioTracksHeading, restoreAudioButton])
+        compressionAudioHeader.spacing = 12
+        audioTracksList.orientation = .vertical; audioTracksList.alignment = .leading; audioTracksList.spacing = 5
+        audioTracksSection.orientation = .vertical; audioTracksSection.alignment = .leading; audioTracksSection.spacing = 8
+        audioTracksSection.addArrangedSubview(compressionAudioHeader); audioTracksSection.addArrangedSubview(audioTracksList)
+        refreshCompressionAudio()
         formatPopup.addItems(withTitles: compressedOutputExtensions.map { "\($0.uppercased()) (.\($0))" })
         formatPopup.selectItem(at: 0)
         formatPopup.target = self
@@ -1828,11 +1943,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         selectionLabel.alignment = .right
         estimateLabel.font = .systemFont(ofSize: 12)
         estimateLabel.textColor = .secondaryLabelColor
-        let editorControlsStack = NSStackView(views: [fileRow, profileRow, formatRow, estimateLabel, cpuRow, joinStack, cutRow])
+        let editorControlsStack = NSStackView(views: [fileRow, profileModeRow, profileRow, audioTracksSection, formatRow, cpuRow, joinStack, cutRow])
         editorControlsStack.orientation = .vertical
         editorControlsStack.alignment = .leading
         editorControlsStack.spacing = 13
-        for view in [fileRow, profileRow!, formatRow!, estimateLabel, cpuRow, joinStack!, cutRow!] {
+        for view in [fileRow, profileModeRow!, profileRow!, audioTracksSection, formatRow!, cpuRow, joinStack!, cutRow!] {
             view.widthAnchor.constraint(equalTo: editorControlsStack.widthAnchor).isActive = true
         }
         workspaceRow = NSStackView(views: [editorControlsStack, playerView])
@@ -1909,6 +2024,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         buttonRow.alignment = .centerY
         buttonRow.spacing = 10
 
+        comparisonRow.orientation = .horizontal
+        comparisonRow.alignment = .top
+        comparisonRow.distribution = .fillEqually
+        comparisonRow.spacing = 24
+        for (title, label) in [(text("Исходник", "Source"), sourceSummaryLabel), (text("Результат", "Output"), estimateLabel)] {
+            let heading = NSTextField(labelWithString: title)
+            heading.font = .systemFont(ofSize: 15, weight: .semibold)
+            label.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .regular)
+            label.textColor = .secondaryLabelColor
+            let column = NSStackView(views: [heading, label])
+            column.orientation = .vertical; column.alignment = .leading; column.spacing = 8
+            label.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+            comparisonRow.addArrangedSubview(column)
+        }
+        technicalHeading.font = .systemFont(ofSize: 12, weight: .semibold)
+        technicalHeading.textColor = .secondaryLabelColor
+        technicalHeading.isHidden = true
         let mainStack = NSStackView(views: [
             header,
             workspaceRow,
@@ -1917,6 +2049,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             statusRow,
             progressBar,
             detailLabel,
+            comparisonRow,
+            technicalHeading,
             resourceLabel,
             sizeLabel,
             technicalLabel
@@ -1947,7 +2081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         contentView.addSubview(buttonRow)
 
         for view in [header, workspaceRow!, previewStack!, separator, statusRow,
-                     progressBar, detailLabel, resourceLabel, sizeLabel, technicalLabel] {
+                     progressBar, detailLabel, comparisonRow, technicalHeading, resourceLabel, sizeLabel, technicalLabel] {
             view.widthAnchor.constraint(equalTo: mainStack.widthAnchor).isActive = true
         }
 
@@ -1985,6 +2119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func createDiagnosticSnapshotIfRequested() {
         guard let path = ProcessInfo.processInfo.environment["VIDEO_EDITOR_SNAPSHOT"] else { return }
         let snapshotMode = ProcessInfo.processInfo.environment["VIDEO_EDITOR_SNAPSHOT_MODE"]
+        if snapshotMode == "youtube" || snapshotMode == "rutube" { profileModeControl.selectedSegment = snapshotMode == "youtube" ? 1 : 2; profileModeChanged(profileModeControl) }
         if snapshotMode == "cut" || snapshotMode == "join" {
             modeControl.selectedSegment = EditorMode.join.rawValue
             modeChanged(modeControl)
@@ -2195,11 +2330,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard !isRunningJob else { return }
         let editing = mode == .cut || mode == .join
         let joining = mode == .join
+        profileModeRow.isHidden = editing
         profileRow.isHidden = editing
+        audioTracksSection.isHidden = editing
         hdrRadio.isHidden = editing
         sdrRadio.isHidden = editing
         formatRow.isHidden = mode == .cut
-        estimateLabel.isHidden = mode != .compress
+        comparisonRow.isHidden = mode != .compress
+        technicalHeading.isHidden = true
         updateSizeEstimate()
         row(withIdentifier: "cpuRow")?.isHidden = mode == .cut
         joinStack.isHidden = !joining
@@ -2259,7 +2397,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let targetMinSize: NSSize
         switch mode {
         case .compress:
-            desiredHeight = 580
+            desiredHeight = 700
             desiredWidth = 720
             targetMinSize = NSSize(width: 600, height: 420)
             playerHeightConstraint.constant = 240
@@ -3356,6 +3494,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard !isRunningJob, !isPreparingAudio else { return }
         analysisToken = UUID()
         sourceInfo = nil
+        excludedAudioTracks.removeAll()
+        refreshCompressionAudio()
         estimateLabel.stringValue = ""
         editProfileButton.isEnabled = false
         hdrRadio.state = .off
@@ -3403,6 +3543,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             DispatchQueue.main.async {
                 guard self.analysisToken == token, self.selectedInputURL == url else { return }
                 self.sourceInfo = info
+                self.preferredProfileID = "copy"
+                self.formatPopup.selectItem(at: self.compressedOutputExtensions.firstIndex(of: url.pathExtension.lowercased()) ?? 2)
+                self.refreshCompressionAudio()
                 if let info {
                     if self.mode == .compress {
                         self.applyAvailableProfiles(for: info)
@@ -3424,7 +3567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         guard let ffprobe = locateTool(named: "ffprobe") else { return nil }
         guard let data = mediaWorker.run(ffprobe, [
             "-v", "error",
-            "-show_entries", "stream=codec_type,codec_name,width,height,sample_aspect_ratio,pix_fmt,color_transfer,avg_frame_rate,bit_rate:stream_side_data=rotation:format=bit_rate,duration",
+            "-show_entries", "stream=index,channels,channel_layout,codec_type,codec_name,width,height,sample_aspect_ratio,pix_fmt,color_transfer,avg_frame_rate,bit_rate:stream_tags=language,title,BPS:stream_side_data=rotation:format=bit_rate,duration",
             "-of", "json",
             url.path
         ], source: url),
@@ -3457,7 +3600,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             pixelFormat: stringValue(video["pix_fmt"]),
             colorTransfer: stringValue(video["color_transfer"]),
             duration: doubleValue(format["duration"]),
-            hasAudio: streams.contains { stringValue($0["codec_type"]) == "audio" }
+            hasAudio: streams.contains { stringValue($0["codec_type"]) == "audio" },
+            audioTracks: streams.filter { stringValue($0["codec_type"]) == "audio" }.enumerated().map { order, stream in
+                let tags = stream["tags"] as? [String: Any] ?? [:]
+                let title = stringValue(tags["title"])
+                let language = stringValue(tags["language"])
+                let rate = max(doubleValue(stream["bit_rate"]), doubleValue(tags["BPS"]))
+                let channels = stringValue(stream["channel_layout"])
+                return CompressionAudioTrack(index: intValue(stream["index"]), title: "\(order + 1). \(language.isEmpty ? "Язык не указан" : language) · \(title.isEmpty ? "Дорожка \(order + 1)" : title) · \(stringValue(stream["codec_name"]).uppercased()) · \(channels.isEmpty ? stringValue(stream["channels"]) + " каналов" : channels)" + (rate > 0 ? String(format: " · ≈%.0f МБ", rate * doubleValue(format["duration"]) / 8_000_000) : " · размер неизвестен"), bitrate: rate)
+            }
         )
     }
 
@@ -3500,7 +3651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     private func applyAvailableProfiles(for info: SourceInfo) {
         editProfileButton.isEnabled = !isRunningJob
-        let supportsHDRChoice = info.isHDR || info.isHighBitDepth
+        let supportsHDRChoice = !isPlatformMode && (info.isHDR || info.isHighBitDepth)
         if supportsHDRChoice && !hdrRadio.isEnabled {
             hdrRadio.state = .on
             sdrRadio.state = .off
@@ -3523,31 +3674,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
 
         profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
-        let selectedIndex = availableProfiles.firstIndex(where: { $0.id == preferredProfileID }) ?? availableProfiles.firstIndex(where: { $0.id == "compact-720-hevc-0.7" }) ?? 0
+        let selectedIndex = availableProfiles.firstIndex(where: { $0.id == preferredProfileID && profileRestriction($0, info: info) == nil }) ?? availableProfiles.firstIndex(where: { $0.id == "copy" }) ?? 0
         profilePopup.selectItem(at: selectedIndex)
         preferredProfileID = availableProfiles[selectedIndex].id
+        updateProfileAvailability()
         updateSizeEstimate()
         profilePopup.isEnabled = !isRunningJob
         startButton.isEnabled = true
         statusLabel.stringValue = text("Готов к запуску", "Ready")
-        detailLabel.stringValue = String(
-            format: text(
-                "%dx%d   •   %.3f fps   •   %@   •   %.3f Мбит/с   •   профилей: %d",
-                "%dx%d   •   %.3f fps   •   %@   •   %.3f Mbps   •   profiles: %d"
-            ),
-            info.width, info.height, info.fps, info.codec, info.videoBitrate, availableProfiles.count
-        )
+        detailLabel.stringValue = ""
+    }
+
+    @objc private func toggleAudioTracks() { audioTracksList.isHidden.toggle() }
+    @objc private func restoreCompressionAudio() { excludedAudioTracks.removeAll(); refreshCompressionAudio(); if let info = sourceInfo { applyAvailableProfiles(for: info) }; updateSizeEstimate() }
+    @objc private func changeCompressionAudio(_ sender: NSButton) {
+        if sender.state == .on { excludedAudioTracks.remove(sender.tag) } else { excludedAudioTracks.insert(sender.tag) }
+        rawEngineSizeText = nil
+        refreshCompressionAudio(); if let info = sourceInfo { applyAvailableProfiles(for: info) }; updateSizeEstimate()
+    }
+    private func refreshCompressionAudio() {
+        for view in audioTracksList.arrangedSubviews { audioTracksList.removeArrangedSubview(view); view.removeFromSuperview() }
+        let tracks = sourceInfo?.audioTracks ?? []
+        audioTracksHeading.title = "Аудиодорожки — \(tracks.count) · оставлено \(tracks.count - excludedAudioTracks.count) ▾"
+        if tracks.isEmpty { audioTracksList.addArrangedSubview(NSTextField(labelWithString: "Аудиодорожек нет")) }
+        for track in tracks {
+            let button = CompressionAudioButton(checkboxWithTitle: track.title, target: self, action: #selector(changeCompressionAudio(_:)))
+            button.tag = track.index; button.state = excludedAudioTracks.contains(track.index) ? .off : .on
+            button.font = .systemFont(ofSize: 12)
+            button.contentTintColor = button.state == .on ? .labelColor : .secondaryLabelColor
+            button.toolTip = track.title + "\nПравый клик — исключить или восстановить. Исходный файл не изменяется."
+            button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            audioTracksList.addArrangedSubview(button)
+            button.widthAnchor.constraint(lessThanOrEqualTo: audioTracksSection.widthAnchor).isActive = true
+        }
     }
 
     private func compressionArguments(_ profile: CompressionProfile) -> [String] {
+        let tracks = (sourceInfo?.audioTracks ?? []).filter { !excludedAudioTracks.contains($0.index) }
+        let selection = ["--select-audio"] + tracks.flatMap { ["--audio-track", String($0.index)] }
+        if profile.id == "copy" { return ["compress", "--profile", "copy"] + selection }
         let preserve = sourceInfo.map { ($0.isHDR || $0.isHighBitDepth) && hdrRadio.state == .on } ?? false
         let rate = sourceInfo.map { profile.bitrate(for: $0, preserveHDR: preserve) } ?? profile.standardBitrate
-        var args = ["compress", "2160", "--short-side", String(profile.targetShortSide), "--codec", preserve ? "hevc" : profile.videoCodec, "--bitrate", String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), rate), "--audio-mode", profile.audioMode, "--audio-bitrate", String(profile.audioBitrate)]
-        if profile.fps > 0 { args += ["--fps", String(profile.fps)] }
+        var args = ["compress", "2160", "--short-side", String(sourceInfo.map { profile.outputShortSide(for: $0) } ?? profile.targetShortSide), "--codec", preserve ? "hevc" : profile.videoCodec, "--bitrate", String(format: "%.4f", locale: Locale(identifier: "en_US_POSIX"), rate), "--audio-mode", profile.audioMode, "--audio-bitrate", String(profile.audioBitrate)]
+        if profile.fps > 0, let info = sourceInfo, Double(profile.fps) < info.fps { args += ["--fps", String(profile.fps)] }
         if profile.encoder == "cpu" { args.append("--cpu") }
         if profile.encoder == "hardware" { args.append("--require-hardware") }
-        if profile.custom { args.append("--allow-larger") }
-        return args
+
+        return args + selection
     }
 
     private var sourceSizeMB: Double {
@@ -3555,18 +3728,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         return Double(bytes) / 1_000_000
     }
 
-    @objc private func formatChanged() { updateSizeEstimate() }
+    @objc private func formatChanged() { rawEngineSizeText = nil; updateSizeEstimate() }
 
     private func updateSizeEstimate() {
         guard mode == .compress, let info = sourceInfo, availableProfiles.indices.contains(profilePopup.indexOfSelectedItem) else {
-            estimateLabel.stringValue = ""; return
+            estimateLabel.stringValue = ""; sourceSummaryLabel.stringValue = ""; return
         }
         let p = availableProfiles[profilePopup.indexOfSelectedItem]
         profilePopup.toolTip = profileTitle(p)
         let preserve = (info.isHDR || info.isHighBitDepth) && hdrRadio.state == .on
-        let size = p.estimateMB(for: info, preserveHDR: preserve)
+        let kept = info.audioTracks.filter { !excludedAudioTracks.contains($0.index) }
+        let isCopy = p.id == "copy"
+        let removedMB = info.audioTracks.filter { excludedAudioTracks.contains($0.index) }.reduce(0.0) { $0 + $1.bitrate * info.duration / 8_000_000 }
+        let size = isCopy ? max(0, sourceSizeMB - removedMB) : estimatedProfileMB(p, info: info)
         let saving = sourceSizeMB > 0 ? (1 - size / sourceSizeMB) * 100 : 0
-        estimateLabel.stringValue = p.dimensions(for: info) + " · " + (p.fps == 0 ? "исходная частота кадров" : "\(p.fps) fps") + "\n" + String(format: "Исходник: %.1f МБ → ≈%.1f МБ (%@) · %@\n%@", sourceSizeMB, size, saving >= 0 ? String(format: "−%.0f%%", saving) : String(format: "+%.0f%%", -saving), selectedOutputExtension.uppercased(), saving >= 0 ? "Оценка по битрейту; фактический размер может отличаться." : "Внимание: результат может быть больше исходника.")
+        let inputFormat = selectedInputURL?.pathExtension.uppercased() ?? "—"
+        sourceSummaryLabel.stringValue = String(format: "Формат: %@\nРазрешение: %d×%d\nВидео: %@\nЧастота: %.3f fps\nЗвук: %@\nРазмер: %.1f МБ", inputFormat, info.width, info.height, info.codec.uppercased(), info.fps, info.hasAudio ? "\(info.audioTracks.count) дорожек" : "нет", sourceSizeMB)
+        var sizeText = String(format: "Размер ≈%.1f МБ (оценка)", size)
+        if isCopy && info.audioTracks.contains(where: { excludedAudioTracks.contains($0.index) && $0.bitrate <= 0 }) { sizeText = "Размер: уточнится после сохранения" }
+        if let raw = rawEngineSizeText {
+            if raw.hasPrefix("Итоговый размер:"), let actual = capture(#"→\s*(.+?)\s*·"#, in: raw) {
+                sizeText = "Размер: " + actual
+            } else if let forecast = capture(#"итог\s*~(.+)$"#, in: raw) {
+                sizeText = "Размер ≈" + forecast + " (прогноз)"
+            }
+        }
+        let codec = isCopy ? info.codec.uppercased() : preserve ? "HEVC HDR" : p.videoCodec.uppercased()
+        let fpsText = String(format: "%.3f fps", isCopy ? info.fps : p.outputFPS(for: info))
+        let sound = kept.isEmpty || (!isCopy && p.audioMode == "remove") ? "нет" : "\(kept.count) дорожек · " + (isCopy ? "без изменений" : "AAC · \(p.audioBitrate) кбит/с")
+        estimateLabel.stringValue = "Формат: \(selectedOutputExtension.uppercased())\nРазрешение: \(isCopy ? "\(info.width)×\(info.height)" : p.dimensions(for: info))\nВидео: \(codec) · \(isCopy ? "без перекодирования" : String(format: "%.2g Мбит/с", p.bitrate(for: info, preserveHDR: preserve)))\nЧастота: \(fpsText)\nЗвук: \(sound)\n\(sizeText)"
+        estimateLabel.toolTip = saving >= 0 ? "Предварительная оценка по битрейту; прогноз уточняется во время сжатия." : "Внимание: результат может быть больше исходника."
+        var warnings: [String] = []
+        if saving < 0 { warnings.append("Результат может быть больше исходника.") }
+        if !warnings.isEmpty { estimateLabel.stringValue += "\n" + warnings.joined(separator: "\n") }
+
+
     }
 
     private func profileNameKey(_ value: String) -> String {
@@ -3584,12 +3780,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     @objc private func editCompressionProfile() {
-        guard !isRunningJob, let info = sourceInfo else { return }
+        guard !isRunningJob, let info = sourceInfo, preferredProfileID != "copy" else { return }
         var base = availableProfiles.indices.contains(profilePopup.indexOfSelectedItem) ? availableProfiles[profilePopup.indexOfSelectedItem] : compactProfiles[0]
         base.container = selectedOutputExtension
         base.color = hdrRadio.state == .on ? "hdr" : "sdr"
         if cpuCheckbox.state == .on { base.encoder = "cpu" }
-        let baseline = (compactProfiles + profiles).first { $0.id == base.id } ?? base
+        let baseline = (compactProfiles + profiles + youtubeProfiles + rutubeProfiles).first { $0.id == base.id } ?? base
         let editor = ProfileEditor(profile: base, info: info, sourceMB: sourceSizeMB, resetTarget: baseline)
         let response = editor.alert.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
         if response == 4 {
@@ -3598,7 +3794,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         } else {
             guard response == 0 || response == 1 || response == 3, var p = editor.result else { return }
             if response == 1 || response == 3 {
-                let others = (compactProfiles + profiles + customProfiles).filter { response != 3 || $0.id != base.id }.map(\.title)
+                let others = (compactProfiles + profiles + youtubeProfiles + rutubeProfiles + customProfiles).filter { response != 3 || $0.id != base.id }.map(\.title)
                 if others.contains(where: { profileNameKey($0) == profileNameKey(p.title) }) {
                     let naming = NSAlert()
                     naming.messageText = "Такое имя профиля уже есть"
@@ -3637,17 +3833,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc private func profileChanged(_ sender: NSPopUpButton) {
         guard availableProfiles.indices.contains(sender.indexOfSelectedItem) else { return }
         let profile = availableProfiles[sender.indexOfSelectedItem]
+        editProfileButton.isEnabled = !isRunningJob
         preferredProfileID = profile.id
+        rawEngineSizeText = nil
         cpuCheckbox.state = profile.encoder == "cpu" ? .on : .off
-        if let index = compressedOutputExtensions.firstIndex(of: profile.container) { formatPopup.selectItem(at: index) }
+        let container = profile.id == "copy" ? (compressedOutputExtensions.contains(selectedInputURL?.pathExtension.lowercased() ?? "") ? selectedInputURL!.pathExtension.lowercased() : "mkv") : profile.container
+        if let index = compressedOutputExtensions.firstIndex(of: container) { formatPopup.selectItem(at: index) }
         if let info = sourceInfo, info.isHDR || info.isHighBitDepth {
-            hdrRadio.state = profile.color == "sdr" ? .off : .on
+            hdrRadio.state = isPlatformMode || profile.color == "sdr" ? .off : .on
             sdrRadio.state = hdrRadio.state == .on ? .off : .on
         }
         let selected = sender.indexOfSelectedItem
         profilePopup.removeAllItems()
         profilePopup.addItems(withTitles: availableProfiles.map(profileTitle))
+        updateProfileAvailability()
         profilePopup.selectItem(at: selected)
+        updateProfileAvailability()
         updateSizeEstimate()
     }
 
@@ -3659,9 +3860,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         applyAvailableProfiles(for: sourceInfo)
     }
 
+    private func estimatedProfileMB(_ profile: CompressionProfile, info: SourceInfo) -> Double {
+        let preserve = !isPlatformMode && (info.isHDR || info.isHighBitDepth) && hdrRadio.state == .on
+        let count = info.audioTracks.isEmpty ? (info.hasAudio ? 1 : 0) : info.audioTracks.filter { !excludedAudioTracks.contains($0.index) }.count
+        let audio = profile.audioMode == "remove" ? 0 : Double(profile.audioBitrate * count) / 1000
+        return info.duration * (profile.bitrate(for: info, preserveHDR: preserve) + audio) / 8 * 1.01
+    }
+
+    private func profileRestriction(_ profile: CompressionProfile, info: SourceInfo) -> String? {
+        if profile.id == "copy" { return nil }
+        if sourceSizeMB > 0 && estimatedProfileMB(profile, info: info) >= sourceSizeMB { return "размер не меньше исходника" }
+        return nil
+    }
+    private func updateProfileAvailability() {
+        profilePopup.menu?.autoenablesItems = false
+        guard let info = sourceInfo else { return }
+        for (index, profile) in availableProfiles.enumerated() {
+            guard let item = profilePopup.item(at: index) else { continue }
+            let reason = profileRestriction(profile, info: info)
+            item.isEnabled = reason == nil
+            item.title = profileTitle(profile)
+        }
+        if availableProfiles.indices.contains(profilePopup.indexOfSelectedItem), profileRestriction(availableProfiles[profilePopup.indexOfSelectedItem], info: info) != nil {
+            let originalIndex = availableProfiles.firstIndex { $0.id == "copy" } ?? 0
+            profilePopup.selectItem(at: originalIndex)
+            preferredProfileID = availableProfiles[originalIndex].id
+        }
+        let copying = preferredProfileID == "copy"
+        editProfileButton.isEnabled = !isRunningJob && !copying
+        cpuCheckbox.isEnabled = !isRunningJob && !copying
+        let colorEnabled = !isPlatformMode && !copying && !isRunningJob && (info.isHDR || info.isHighBitDepth)
+        hdrRadio.isEnabled = colorEnabled; sdrRadio.isEnabled = colorEnabled
+    }
+
     private func compressionProfiles(for info: SourceInfo) -> [CompressionProfile] {
         let savedIDs = Set(customProfiles.map(\.id))
-        return (compactProfiles + profiles).filter { !savedIDs.contains($0.id) && isProfileAvailable($0, for: info) } + customProfiles + [oneTimeProfile].compactMap { $0 }
+        let builtins = modeBuiltinProfiles
+        let builtinIDs = Set(builtins.map(\.id))
+        let saved = customProfiles.filter { $0.id.hasPrefix("custom-") || builtinIDs.contains($0.id) }
+        let candidates = builtins.filter { !savedIDs.contains($0.id) } + saved + [oneTimeProfile].compactMap { $0 }
+        let all = [originalProfile] + candidates
+        guard sourceSizeMB > 0 else { return all }
+        return all.enumerated().sorted {
+            let left = $0.element.id == "copy" ? sourceSizeMB : estimatedProfileMB($0.element, info: info)
+            let right = $1.element.id == "copy" ? sourceSizeMB : estimatedProfileMB($1.element, info: info)
+            return left == right ? $0.offset < $1.offset : left < right
+        }.map(\.element)
     }
 
     private func isProfileAvailable(_ profile: CompressionProfile, for info: SourceInfo) -> Bool {
@@ -4327,6 +4571,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         case .compress:
             guard availableProfiles.indices.contains(profilePopup.indexOfSelectedItem) else { return }
             let profile = availableProfiles[profilePopup.indexOfSelectedItem]
+            if let info = sourceInfo, let reason = profileRestriction(profile, info: info) {
+                showError(title: "Профиль недоступен", message: reason)
+                return
+            }
             arguments = compressionArguments(profile)
             if let sourceInfo, sourceInfo.isHDR || sourceInfo.isHighBitDepth {
                 arguments.append(hdrRadio.state == .on ? "--preserve-hdr" : "--convert-sdr")
@@ -4522,6 +4770,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     }
 
     private func processLine(_ rawLine: String, isError: Bool) {
+        defer {
+            if mode == .compress {
+                updateSizeEstimate()
+                sizeLabel.isHidden = true
+                technicalHeading.isHidden = resourceLabel.isHidden && technicalLabel.isHidden
+            }
+        }
         let line = rawLine
             .replacingOccurrences(
                 of: "\u{001B}\\[[0-9;?]*[A-Za-z]",
@@ -4764,11 +5019,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private func setRunning(_ running: Bool) {
         isRunningJob = running
         modeControl.isEnabled = !running
+        profileModeControl.isEnabled = !running
         browseButton.isEnabled = !running
         profilePopup.isEnabled = !running && !availableProfiles.isEmpty
         formatPopup.isEnabled = !running
-        editProfileButton.isEnabled = !running && sourceInfo != nil
-        let supportsHDRChoice = sourceInfo?.isHDR == true || sourceInfo?.isHighBitDepth == true
+        editProfileButton.isEnabled = !running && sourceInfo != nil && preferredProfileID != "copy"
+        audioTracksHeading.isEnabled = !running
+        restoreAudioButton.isEnabled = !running
+        for case let button as NSButton in audioTracksList.arrangedSubviews { button.isEnabled = !running }
+        let supportsHDRChoice = !isPlatformMode && (sourceInfo?.isHDR == true || sourceInfo?.isHighBitDepth == true)
         hdrRadio.isEnabled = !running && supportsHDRChoice
         sdrRadio.isEnabled = !running && supportsHDRChoice
         cpuCheckbox.isEnabled = !running

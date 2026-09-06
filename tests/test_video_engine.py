@@ -50,12 +50,27 @@ class EngineTests(unittest.TestCase):
                       '--plain-progress', '-o', output, *extra])
         return result, output
 
+    def test_compression_caps_resolution_and_fps_by_source(self):
+        padded = self.root / 'padded.mp4'
+        shutil.copyfile(self.source, padded)
+        with padded.open('ab') as stream:
+            stream.truncate(2_000_000)
+        output = self.root / 'capped.mp4'
+        result = run([ENGINE, 'compress', '1080', '-f', padded, '-o', output,
+                      '--bitrate', '0.3', '--fps', '60', '--audio-mode', 'remove',
+                      '--cpu', '--convert-sdr', '--plain-progress'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        video = self.probe(output)['streams'][0]
+        self.assertEqual((video['width'], video['height']), (160, 90))
+        self.assertEqual(video['avg_frame_rate'], '30/1')
+        self.assertLess(output.stat().st_size, padded.stat().st_size)
+
     def test_custom_compression_parameters(self):
         for codec, audio in [('h264', 'remove'), ('hevc', 'aac')]:
             output = self.root / f'custom-{codec}.mp4'
             result = run([ENGINE, 'compress', '2160', '-f', self.source, '-o', output,
                           '--short-side', '128', '--bitrate', '0.3', '--codec', codec,
-                          '--fps', '15', '--audio-mode', audio, '--audio-bitrate', '64',
+                          '--fps', '15', '--audio-mode', audio, '--audio-bitrate', '384',
                           '--allow-larger', '--cpu', '--convert-sdr', '--plain-progress'])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             data = self.probe(output)
@@ -71,6 +86,25 @@ class EngineTests(unittest.TestCase):
                       '--short-side', '129', '--cpu'])
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(invalid.exists())
+
+    def test_audio_track_selection_and_copy(self):
+        source = self.root / 'multi.mkv'
+        result = run([FFMPEG, '-v', 'error', '-i', self.source, '-map', '0:v', '-map', '0:a', '-map', '0:a', '-c', 'copy', '-metadata:s:a:0', 'title=Russian', '-metadata:s:a:1', 'title=English', source])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for chosen in [[], [2], [1, 2]]:
+            output = self.root / ('selected-' + str(len(chosen)) + '.mkv')
+            result = run([ENGINE, 'compress', '--profile', 'copy', '-f', source, '-o', output, '--select-audio', *[v for index in chosen for v in ['--audio-track', str(index)]]])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            streams = self.probe(output)['streams']
+            self.assertEqual(len(streams), 1 + len(chosen))
+            if chosen == [2]: self.assertEqual(streams[1]['tags']['title'], 'English')
+            def video_hash(path):
+                return run([FFMPEG, '-v', 'error', '-i', path, '-map', '0:v:0', '-c', 'copy', '-f', 'hash', '-hash', 'sha256', '-']).stdout
+            self.assertEqual(video_hash(source), video_hash(output))
+        output = self.root / 'multi-compressed.mp4'
+        result = run([ENGINE, 'compress', '2160', '--short-side', '128', '--bitrate', '0.3', '--cpu', '--allow-larger', '-f', source, '-o', output, '--select-audio', '--audio-track', '1', '--audio-track', '2'])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.probe(output)['streams']), 3)
 
     def test_output_containers(self):
         manifest = self.root / 'formats.tsv'
